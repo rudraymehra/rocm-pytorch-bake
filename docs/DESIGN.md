@@ -349,7 +349,7 @@ None of these need a GPU.
 5. Add the telemetry harness and Grafana dashboard; enable T2 on your cluster.
 6. Run the EC2 benchmark campaign; publish raw data and a short report.
 
-## 9. Questions for you
+## 9. Questions still to be answered
 
 1. **Torch from source:** Do you need torch built from source because you carry PyTorch patches? If so, where do they live? `patches/pytorch/` in AIC is currently empty.
 2. **ROCm base:** TheRock `rocm-sdk` (as in your `buildx-bake` branch) or `/opt/rocm` 7.14 (as in AIC main)? This decides the wheel model and whether `HIP_CLANG_LAUNCHER` is available.
