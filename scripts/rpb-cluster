@@ -27,7 +27,7 @@ while [ "$#" -gt 0 ]; do
         *) usage ;;
     esac
 done
-[ -n "$builders" ] && [ -n "$registry" ] || usage
+if [ -z "$builders" ] || [ -z "$registry" ]; then usage; fi
 read -r -a bl <<< "$builders"
 first=${bl[0]}
 group="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD)"
