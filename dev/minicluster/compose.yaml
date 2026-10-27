@@ -1,12 +1,14 @@
 # Dev mini-cluster for a laptop with Docker Desktop: two remote BuildKit builders,
 # zot and Valkey, wired exactly like the real cluster (mTLS, plain-HTTP zot,
-# Redis-backed sccache). Driven by dev/minicluster/run.sh; never used in production.
+# Redis-backed sccache), plus node-exporter and Prometheus with the real
+# infra/monitoring/prometheus.yml. Driven by dev/minicluster/run.sh; never used in production.
 name: rpb-mini
 
 services:
   zot:
     image: ghcr.io/project-zot/zot:v2.1.22@sha256:96cda11459ce6f8c60da3b03f03e9f67fd11b3ae2d82c4c04c92b3c608996080
     command: ["serve", "/etc/zot/config.json"]
+    ports: ["127.0.0.1:15000:5000"]   # for the independent checks in run.sh
     volumes:
       - ../../infra/cache-node/zot-config.json:/etc/zot/config.json:ro
       - zot-data:/var/lib/registry
@@ -16,6 +18,24 @@ services:
     command: ["valkey-server", "/etc/valkey/valkey.conf"]
     volumes:
       - ./.state/valkey:/etc/valkey:ro
+    # BuildKit drops Docker's embedded DNS (127.0.0.11) from the resolv.conf of RUN
+    # steps, so sccache inside a build cannot resolve "valkey". A fixed address
+    # works, as the real cluster uses the cache node's IP.
+    networks:
+      default:
+        ipv4_address: 10.231.0.10
+
+  node-exporter:
+    image: prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+    command: ["--collector.textfile.directory=/textfile"]
+    volumes:
+      - ./.state/textfile:/textfile:ro
+
+  prometheus:
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    ports: ["127.0.0.1:19090:9090"]
+    volumes:
+      - ./.state/prometheus:/etc/prometheus:ro
 
   builder1: &builder
     image: moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
@@ -34,6 +54,12 @@ services:
     volumes:
       - ./.state/buildkit:/etc/buildkit:ro
       - builder2-state:/var/lib/buildkit
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.231.0.0/24
 
 volumes:
   zot-data:
