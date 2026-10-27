@@ -1,4 +1,5 @@
-# Local entry points. CI runs the same commands (.github/workflows/pr.yml).
+# Local entry points. `make check` runs the build-definition and code checks of the static CI job;
+# CI also runs actionlint, markdownlint, lychee and typos (docs/CI.md).
 .PHONY: check test lint-docker lint-shell check-config check-prometheus minicluster-test
 
 check: lint-docker lint-shell check-config check-prometheus test
@@ -10,7 +11,8 @@ lint-docker:
 	hadolint --config .hadolint.yaml docker/*.Dockerfile dev/minicluster/toy.Dockerfile
 
 lint-shell:
-	shellcheck scripts/rpb scripts/rpb-cluster scripts/rpb-sccache-run scripts/rpb-check-offload-arch infra/*/*.sh bench/*.sh dev/minicluster/run.sh
+	shellcheck scripts/rpb scripts/rpb-cluster scripts/rpb-sccache-run scripts/rpb-check-offload-arch scripts/rpb-set-rocm-rpath infra/*/*.sh bench/*.sh dev/minicluster/run.sh
+	python3 -m py_compile scripts/check-pins scripts/rpb-write-constraints scripts/rpb-build-amdsmi scripts/bake-graph
 
 check-config:
 	cd tools/check-buildkitd-config && go run . ../../infra/buildkit/buildkitd.toml
@@ -22,7 +24,7 @@ check-prometheus:
 test:
 	python3 -m pytest -q telemetry/tests
 
+# The cluster is always removed, also when a check fails; the failing check names
+# its log in dev/minicluster/.logs/, which stays until the next `up`.
 minicluster-test:
-	dev/minicluster/run.sh up
-	dev/minicluster/run.sh test
-	dev/minicluster/run.sh down
+	dev/minicluster/run.sh up && dev/minicluster/run.sh test; status=$$?; dev/minicluster/run.sh down; exit $$status
