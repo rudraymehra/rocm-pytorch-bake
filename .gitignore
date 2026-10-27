@@ -1,0 +1,17 @@
+# Site-specific bake values (registry address, secret file paths, job counts)
+docker-bake.override.hcl
+# Build outputs and run records (published runs are copied to data/ deliberately)
+out/
+results/
+# Secrets and certificates: never in git
+secrets/
+*.pem
+*.key
+*.env
+# Dev mini-cluster state
+dev/minicluster/.state/
+# Python
+__pycache__/
+.pytest_cache/
+.venv/
+.rpb-routes

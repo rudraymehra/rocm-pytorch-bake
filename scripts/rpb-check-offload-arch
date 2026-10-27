@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Fail if any shared object under the given directories carries GPU code for a
+# target other than the expected one.
+#
+#   rpb-check-offload-arch <gfx> <dir> [<dir>...]
+set -euo pipefail
+
+if [ "$#" -lt 2 ]; then
+    echo "usage: rpb-check-offload-arch <gfx> <dir> [<dir>...]" >&2
+    exit 2
+fi
+want=$1
+shift
+
+checked=0
+bad=0
+while IFS= read -r -d '' so; do
+    archs=$(llvm-objdump --offloading "$so" 2>/dev/null | grep -oE 'gfx[0-9a-f]+' | sort -u || true)
+    [ -z "$archs" ] && continue
+    checked=$((checked + 1))
+    if [ "$archs" != "$want" ]; then
+        printf 'unexpected GPU targets in %s:\n%s\n' "$so" "$archs" >&2
+        bad=$((bad + 1))
+    fi
+done < <(find "$@" -type f -name '*.so*' -print0)
+
+echo "rpb-check-offload-arch: ${checked} objects with GPU code, ${bad} with unexpected targets"
+if [ "$checked" -eq 0 ]; then
+    echo "rpb-check-offload-arch: no GPU code found at all; the build did not target ${want}" >&2
+    exit 1
+fi
+[ "$bad" -eq 0 ]

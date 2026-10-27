@@ -1,0 +1,18 @@
+# Copy to docker-bake.override.hcl (gitignored) on the host that runs bake.
+# bake merges it automatically; every value here can also be passed with --var.
+
+variable "CACHE_REGISTRY" {
+  default = "zot.lan:5000"
+}
+
+variable "SCCACHE_ENV_FILE" {
+  default = "/abs/path/to/secrets/sccache.env"
+}
+
+variable "MAX_JOBS" {
+  default = 64
+}
+
+variable "FANOUT_JOBS" {
+  default = 16
+}

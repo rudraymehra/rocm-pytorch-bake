@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Pin the installed torch and triton so later pip installs cannot replace them.
+
+    rpb-write-constraints /etc/rpb-constraints.txt
+"""
+import importlib.metadata as md
+import sys
+
+torch_v = md.version("torch")
+triton_v = md.version("triton")
+if "+rpb." not in torch_v:
+    sys.exit(f"installed torch {torch_v} is not our build (+rpb.)")
+with open(sys.argv[1], "w") as f:
+    f.write(f"torch=={torch_v}\ntriton=={triton_v}\n")
+print(f"torch=={torch_v}\ntriton=={triton_v}")

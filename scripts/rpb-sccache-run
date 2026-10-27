@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Run one compile command under a private sccache server and record its telemetry.
+#
+#   rpb-sccache-run <name> -- <command> [args...]
+#
+# Writes /out/telemetry/<name>-sccache.json and /out/telemetry/<name>-time.txt.
+# If the BuildKit secret "sccache_env" is mounted, it is sourced first; it turns on
+# the shared Redis level (SCCACHE_MULTILEVEL_CHAIN=disk,redis plus credentials).
+# If that level is unreachable, the build continues with the local disk level only.
+set -euo pipefail
+
+if [ "$#" -lt 3 ] || [ "$2" != "--" ]; then
+    echo "usage: rpb-sccache-run <name> -- <command> [args...]" >&2
+    exit 2
+fi
+name=$1
+shift 2
+
+telemetry_dir=${RPB_TELEMETRY_DIR:-/out/telemetry}
+mkdir -p "$telemetry_dir"
+
+secret=/run/secrets/sccache_env
+if [ -f "$secret" ]; then
+    set -a
+    # shellcheck source=/dev/null
+    . "$secret"
+    set +a
+fi
+
+# BuildKit RUN steps share the daemon's network namespace, so concurrent steps
+# would collide on sccache's default TCP port. A Unix socket in this step's own
+# filesystem keeps each server private.
+export SCCACHE_SERVER_UDS=/tmp/rpb-sccache-${name}.sock
+
+if ! sccache --start-server; then
+    echo "rpb-sccache-run: shared cache level unavailable; continuing with the local disk level only" >&2
+    unset SCCACHE_MULTILEVEL_CHAIN SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY \
+          SCCACHE_REDIS_ENDPOINT SCCACHE_REDIS_USERNAME SCCACHE_REDIS_PASSWORD \
+          SCCACHE_REDIS_KEY_PREFIX
+    sccache --start-server
+fi
+sccache --zero-stats >/dev/null
+
+status=0
+/usr/bin/time -v -o "$telemetry_dir/${name}-time.txt" "$@" || status=$?
+
+sccache --show-stats --stats-format=json > "$telemetry_dir/${name}-sccache.json" || true
+sccache --stop-server >/dev/null || true
+exit "$status"

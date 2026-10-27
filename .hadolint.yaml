@@ -1,0 +1,12 @@
+# hadolint configuration. Every ignored rule has a reason.
+ignored:
+  # FROM base / torch-dev / scratch refer to bake named contexts, not registry images;
+  # real images are pinned by digest.
+  - DL3006
+  # cd inside RUN is used to enter bind-mounted source trees that exist only for that step.
+  - DL3003
+  # apt and pip packages are not version-pinned individually: the OS image is pinned by
+  # digest, Python inputs are pinned by upstream requirement files plus our constraints,
+  # and BuildKit's layer cache keeps the resolved result stable between pin bumps.
+  - DL3008
+  - DL3013

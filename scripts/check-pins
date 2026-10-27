@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Check that every source pin in docker-bake.hcl is self-consistent.
+
+For each <NAME>_REF / <NAME>_SHA pair: the ref must resolve (git ls-remote) to the
+SHA, or be the SHA itself. Also checks that the Dockerfile fallback BASE_IMAGE
+equals the bake default. Needs network access to the git hosts.
+Set BUILDX to override the buildx command (default "docker buildx").
+
+    python3 scripts/check-pins
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+REPOS = {
+    "TORCH": "https://github.com/pytorch/pytorch.git",
+    "TRITON": "https://github.com/ROCm/triton.git",
+    "AITER": "https://github.com/ROCm/aiter.git",
+    "FA": "https://github.com/Dao-AILab/flash-attention.git",
+    "LMCACHE": "https://github.com/LMCache/LMCache.git",
+    "VLLM": "https://github.com/vllm-project/vllm.git",
+}
+
+
+def bake_variables() -> dict:
+    out = subprocess.run(
+        os.environ.get("BUILDX", "docker buildx").split() + ["bake", "--list", "type=variables,format=json"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    return {v["name"]: v.get("value", "") for v in json.loads(out)}
+
+
+def resolve(repo: str, ref: str) -> set:
+    out = subprocess.run(
+        ["git", "ls-remote", repo, f"refs/tags/{ref}", f"refs/tags/{ref}^{{}}", f"refs/heads/{ref}"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    return {line.split("\t")[0] for line in out.splitlines()}
+
+
+def main() -> int:
+    v = bake_variables()
+    bad = 0
+    repos = dict(REPOS, TORCH=v.get("TORCH_GIT_URL", REPOS["TORCH"]))
+    for name, repo in repos.items():
+        ref, sha = v[f"{name}_REF"], v[f"{name}_SHA"]
+        if re.fullmatch(r"[0-9a-f]{40}", ref):
+            ok = ref == sha
+        else:
+            ok = sha in resolve(repo, ref)
+        print(f"{'ok ' if ok else 'BAD'} {name}: {ref} -> {sha}")
+        bad += not ok
+    df = open("docker/base.Dockerfile").read()
+    m = re.search(r"^ARG BASE_IMAGE=(\S+)$", df, re.M)
+    if not m or m.group(1) != v["BASE_IMAGE"]:
+        print(f"BAD BASE_IMAGE: Dockerfile fallback {m.group(1) if m else None} != bake {v['BASE_IMAGE']}")
+        bad += 1
+    else:
+        print("ok  BASE_IMAGE: Dockerfile fallback matches the bake default")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
