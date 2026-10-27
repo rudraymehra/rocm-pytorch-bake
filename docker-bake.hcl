@@ -401,6 +401,8 @@ target "lint" {
   matrix     = { df = ["base", "torch", "triton", "torch-dev", "aiter", "fa", "lmcache", "vllm", "test"] }
   dockerfile = "docker/${df}.Dockerfile"
   call       = "check"
+  # The check still validates ADD flags, and "sha256:" with an empty value is rejected.
+  args = { SCCACHE_SHA256 = SCCACHE_SHA256 }
   contexts = {
     base          = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
     torch-dev     = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
