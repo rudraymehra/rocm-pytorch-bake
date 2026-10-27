@@ -1,0 +1,34 @@
+# Build telemetry in Prometheus.
+#   Every host that runs scripts/rpb:  docker compose -f infra/monitoring/compose.yaml --profile client up -d
+#   One monitoring host (cache node):  infra/monitoring/install.sh  (profile "server")
+# Both use the host network. Firewall: 9100/tcp from the Prometheus host only;
+# 9090/tcp from the people who read the dashboards.
+name: rpb-monitoring
+
+services:
+  node-exporter:
+    profiles: ["client"]
+    image: prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+    command:
+      - --path.rootfs=/host
+      - --collector.textfile.directory=/textfile
+    network_mode: host
+    pid: host
+    restart: unless-stopped
+    volumes:
+      - /:/host:ro,rslave
+      # scripts/rpb writes here when RPB_TEXTFILE_DIR=/var/lib/rpb/textfile
+      - /var/lib/rpb/textfile:/textfile:ro
+
+  prometheus:
+    profiles: ["server"]
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=90d
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ${PROM_CONF_DIR:?set PROM_CONF_DIR to the directory holding the rendered prometheus.yml}:/etc/prometheus:ro
+      - ${PROM_DATA:?set PROM_DATA to a data directory}:/prometheus

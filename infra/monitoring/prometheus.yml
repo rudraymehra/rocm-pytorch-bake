@@ -1,0 +1,18 @@
+# Prometheus for the build cluster. infra/monitoring/install.sh fills in the
+# placeholders; dev/minicluster/run.sh does the same for the laptop cluster.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # rpb_* build telemetry, read by node-exporter's textfile collector on every
+  # host that runs scripts/rpb (CI runners, admin hosts).
+  - job_name: rpb
+    static_configs:
+      - targets: [RPB_CLIENT_TARGETS]
+
+  # zot's own metrics: requests, storage, pushes and pulls of the layer cache.
+  - job_name: zot
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["ZOT_ADDR"]
