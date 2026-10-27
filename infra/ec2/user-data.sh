@@ -3,15 +3,18 @@
 # Installs Docker and buildx v0.38.1, mounts the data volume at /nvme, and arms
 # two dead-man switches so a forgotten instance cannot run up a bill:
 #   1. a hard power-off after MAX_HOURS (shutdown behaviour is "terminate")
-#   2. a power-off when /run/rpb/heartbeat is older than 30 minutes; bench/run-matrix.sh
-#      touches it every minute while it runs, so this fires when the harness dies
+#   2. a power-off when /run/rpb/heartbeat is older than 30 minutes; scripts/rpb and
+#      bench/run-matrix.sh touch it every minute while they run and remove it when they
+#      finish, so this fires only when a build or the harness dies. There is no file
+#      at boot, so setting up the host is not timed.
+# infra/ec2/launch.sh replaces the MAX_HOURS line with its own value.
 set -euo pipefail
 MAX_HOURS=5
 
 shutdown -h "+$((MAX_HOURS * 60))" "rpb: hard session limit"
 
-# /run/rpb is writable by every user: bench/run-matrix.sh runs as the login user.
-mkdir -p /run/rpb && chmod 1777 /run/rpb && touch /run/rpb/heartbeat && chmod 0666 /run/rpb/heartbeat
+# /run/rpb is writable by every user, so scripts/rpb can keep the heartbeat as any user.
+mkdir -p /run/rpb && chmod 1777 /run/rpb
 cat > /usr/local/bin/rpb-heartbeat-check <<'SH'
 #!/bin/sh
 f=/run/rpb/heartbeat
@@ -56,5 +59,6 @@ curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-buildx \
 echo "e25d5cd675092bb5d1d03632fdc46cdf3fede7b514dc5f023a105e00d3ce5ad4  /usr/local/lib/docker/cli-plugins/docker-buildx" | sha256sum -c -
 chmod 0755 /usr/local/lib/docker/cli-plugins/docker-buildx
 systemctl enable --now docker
+usermod -aG docker ubuntu
 docker buildx version
 touch /run/rpb/ready

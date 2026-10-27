@@ -41,6 +41,12 @@ done
 read -r -a target_list <<< "$targets"
 [ "${#target_list[@]}" -gt 0 ] || usage
 
+# bake --var and --jobs need buildx v0.38.0; older versions fail with "unknown flag".
+bx=$(docker buildx version | awk '{print $2}' | sed 's/^v//')
+case "$bx" in
+    0.[0-9].*|0.[0-2][0-9].*|0.3[0-7].*) echo "rpb: buildx $bx is too old; v0.38.0 or later is needed" >&2; exit 2 ;;
+esac
+
 # buildx refuses to read files outside the working directory unless allowed. Grant
 # read access to the directory of the sccache secret file only, if one is given.
 secret_file=${SCCACHE_ENV_FILE:-}
@@ -58,7 +64,8 @@ fi
 
 # The builder and a random suffix are part of the id: scripts/rpb-cluster starts
 # runs on several builders in the same second, and every run needs its own directory.
-run_id="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD)-$builder-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')"
+sha=$(git rev-parse --short HEAD)
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$sha-$builder-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')"
 res="results/$run_id"
 mkdir -p "$res/inspect" "$res/steps" "$res/telemetry"
 if [ -n "${RPB_RUN_DIR_FILE:-}" ]; then
@@ -79,6 +86,17 @@ python3 -m telemetry.runmeta pins "$res/bake-print.json" > "$res/pins.json"
 outputs=()
 while IFS= read -r dest; do outputs+=("$dest"); done < <(python3 -m telemetry.runmeta outputs "$res/bake-print.json")
 for dest in ${outputs[@]+"${outputs[@]}"}; do rm -rf "$dest"; done
+
+# On an EC2 benchmark host (infra/ec2/user-data.sh) a dead-man switch powers the
+# machine off when /run/rpb/heartbeat is older than 30 minutes. Keep it fresh while
+# the build runs and remove it at the end, so it only fires if this process dies.
+heartbeat=/run/rpb/heartbeat beat_pid=""
+if [ -d /run/rpb ]; then
+    touch "$heartbeat"
+    ( while sleep 60; do touch "$heartbeat"; done ) &
+    beat_pid=$!
+    trap 'kill "$beat_pid" 2>/dev/null; rm -f "$heartbeat"' EXIT
+fi
 
 now() { python3 -c "import time; print(time.time())"; }
 t_start=$(now)

@@ -222,8 +222,8 @@ variable "TORCH_DEV_IMAGE" {
 }
 variable "MAX_JOBS" {
   type        = number
-  default     = 64
-  description = "Compiler jobs for the torch build. Part of the layer cache key: use one value per host class"
+  default     = 32
+  description = "Compiler jobs for the torch build: at most min(cores, RAM GiB / 2.5). Part of the layer cache key: use one value per host class"
   validation {
     condition     = MAX_JOBS > 0 && floor(MAX_JOBS) == MAX_JOBS
     error_message = "MAX_JOBS must be a positive whole number."
@@ -231,8 +231,8 @@ variable "MAX_JOBS" {
 }
 variable "FANOUT_JOBS" {
   type        = number
-  default     = 16
-  description = "Compiler jobs for each of Triton, torchvision, AITER, FA, LMCache and vLLM (several run in parallel)"
+  default     = 8
+  description = "Compiler jobs for each of Triton, torchvision, AITER, FA, LMCache and vLLM (several run in parallel): about MAX_JOBS / 4"
   validation {
     condition     = FANOUT_JOBS > 0 && floor(FANOUT_JOBS) == FANOUT_JOBS
     error_message = "FANOUT_JOBS must be a positive whole number."

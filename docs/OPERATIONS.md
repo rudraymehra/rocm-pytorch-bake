@@ -1,9 +1,19 @@
 # Operations
 
 How to stand up and run the build cluster. Everything here is scripted; this
-page says which script to run, where, and how to check it worked. These scripts
-have not yet run on a real cluster; the mini-cluster (`dev/minicluster/run.sh`) uses the
-same config files through Compose, not these scripts.
+page says which script to run, where, and how to check it worked. The mini-cluster
+(`dev/minicluster/run.sh`) runs `make-certs.sh`, `make-secrets.sh` and
+`create-builders.sh` and the same config files, but starts the daemons through its
+own Compose file. The install scripts have run in Ubuntu 24.04 test hosts, not yet
+on a real cluster.
+
+## Prerequisites
+
+| Host | Needs |
+|---|---|
+| Every host | Linux x86_64, Docker Engine with Docker Compose v2 (`docker compose version`; on Ubuntu `docker.io` plus `docker-compose-v2`; Debian 12's own packages are too old, use Docker CE), `curl` |
+| Admin host | `openssl` |
+| Client | buildx v0.38.0 or later (`docker buildx version`; Ubuntu 24.04 ships 0.30, install the release binary as `infra/ec2/user-data.sh` does), `python3` 3.10 or later, `git` |
 
 ## Layout
 
@@ -20,19 +30,24 @@ both name), because `buildkitd.toml` marks exactly that registry as plain HTTP.
 
 ## Security
 
-zot, Valkey's admin user, node-exporter and Prometheus have no authentication of
-their own on this LAN setup: the firewall is the access control. On each host,
-allow only the listed sources (example with ufw, builders 10.0.0.11-12, clients
-10.0.0.20-21, cache and monitoring node 10.0.0.5):
+zot, node-exporter and Prometheus have no authentication of their own on this
+LAN setup, and Valkey only has passwords: the firewall is the access control. On
+each host, allow SSH first, then only the listed sources (example with ufw,
+builders 10.0.0.11-12, clients 10.0.0.20-21, cache and monitoring node 10.0.0.5,
+admin workstation 10.0.0.2):
 
 ```sh
+sudo ufw allow OpenSSH
 # cache node
 sudo ufw allow from 10.0.0.11 to any port 5000,6379 proto tcp
 sudo ufw allow from 10.0.0.12 to any port 5000,6379 proto tcp
+sudo ufw allow from 10.0.0.2 to any port 9090 proto tcp
 # each builder
 sudo ufw allow from 10.0.0.20 to any port 1234 proto tcp
 # each client
 sudo ufw allow from 10.0.0.5 to any port 9100 proto tcp
+# then, on every host
+sudo ufw enable
 ```
 
 BuildKit itself requires a client certificate signed by the cluster CA (mTLS).
@@ -71,7 +86,8 @@ sudo ZOT_ADDR=10.0.0.5:5000 STATE_DIR=/nvme/buildkit \
      CERT_DIR=secrets/certs/daemon/build1.lan infra/buildkit/run-buildkitd.sh
 ```
 
-Expected: `buildctl github.com/moby/buildkit v0.34.1 …`, then
+`STATE_DIR` is created if missing. `CERT_DIR` is the directory named after the
+host as it was given to `make-certs.sh`. Expected: `buildctl github.com/moby/buildkit v0.34.1 …`, then
 `buildkitd is up on tcp://<this host's FQDN>:1234`.
 
 ## 4. Each client
@@ -120,7 +136,44 @@ sudo CACHE_NODE_IP=10.0.0.5 CACHE_DATA=/nvme/cache SECRETS=secrets VALKEY_MAXMEM
 The containers are recreated with the new value. Valkey keeps no data on disk, so
 the shared compile cache starts empty again.
 
+## One small host (EC2)
+
+When only one machine is available, every role runs on it: cache node, builder,
+client and monitoring, with `10.0.0.5`, `build1.lan` and the client addresses
+above all replaced by the host's private IP. This is also the benchmark layout
+(`bench/reset.sh` expects zot, Valkey and buildkitd on the same host).
+
+```sh
+KEY_NAME=... SUBNET_ID=... SG_ID=... MARKET=on-demand MAX_HOURS=12 \
+    infra/ec2/launch.sh m7a.2xlarge 400
+```
+
+- **Quota.** Spot and on-demand have separate vCPU quotas (Service Quotas, EC2:
+  "All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests", L-34B43A08,
+  and "Running On-Demand Standard ... instances", L-1216C47A). `MARKET` must name
+  a market whose quota covers the instance. On an 8-vCPU quota, m7a.2xlarge
+  (32 GiB) or r7a.2xlarge (64 GiB, room for `MAX_JOBS=8`) fit; AMD m7a and r7a
+  give 8 real cores, where an 8-vCPU Intel instance has 4 cores with two threads
+  each.
+- **Security group.** Only SSH (22) from your address. Nothing else has to be
+  reachable from outside on a single host.
+- **Job counts and memory.** Leave room for Valkey: `VALKEY_MAXMEMORY=4gb` for
+  the cache node install, and in `rpb.env` `MAX_JOBS=6` and `FANOUT_JOBS=2`
+  (about 2.5 GiB per compiler job). Leave `AITER_PREBUILD` at 0 on the first build.
+- **Time.** A cold build on 8 cores is an estimated 3 to 10 hours (not measured
+  yet). The host powers itself off after `MAX_HOURS` (default 5) and terminates,
+  which deletes its disks: copy `results/` and `out/` off the host before then.
+- **Dead-man switch.** `scripts/rpb` and `bench/run-matrix.sh` keep
+  `/run/rpb/heartbeat` fresh while they run and remove it at the end. If a build
+  is killed and the file goes 30 minutes without an update, the host powers off.
+  Setting up the host is not timed.
+- **Login user.** `user-data.sh` adds `ubuntu` to the `docker` group (log in again
+  after the first boot). Run `bench/run-matrix.sh` with `sudo -E`: the BK and OS
+  reset levels need root.
+
 ## Teardown (EC2)
 
 `infra/ec2/teardown-check.sh` must print `clean` at the end of every session. It
-exits 2, never `clean`, when any AWS call fails.
+exits 2, never `clean`, when any AWS call fails. It searches every region, so the
+AWS CLI needs a default region (`AWS_REGION` or `aws configure`) only for its first
+call.

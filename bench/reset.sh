@@ -13,6 +13,8 @@ set -euo pipefail
 
 : "${STATE_DIR:?}" "${CACHE_DATA:?}" "${SECRETS:?}" "${ZOT_ADDR:?}" "${CERT_DIR:?}"
 repo=$(cd "$(dirname "$0")/.." && pwd)
+# compose.yaml needs both even to stop one service; same values as infra/cache-node/install.sh.
+export CACHE_DATA VALKEY_CONF_DIR=/etc/valkey
 IFS=, read -r -a levels <<< "${1:?usage: bench/reset.sh BK,SC,RG,OS}"
 
 # The BK and RG levels delete directory contents: refuse anything that is not

@@ -21,7 +21,8 @@ if [ "$#" -ne 5 ]; then
     exit 2
 fi
 scenario=$1 reps=$2 aic=$3 builder=$4 gfx=$5
-: "${ZOT_ADDR:?}" "${SECRETS:?}"
+# Everything bench/reset.sh needs too, checked before the first run starts.
+: "${ZOT_ADDR:?}" "${SECRETS:?}" "${STATE_DIR:?}" "${CACHE_DATA:?}" "${CERT_DIR:?}"
 repo=$(cd "$(dirname "$0")/.." && pwd)
 
 reset="" configs="rpb aic"
@@ -36,6 +37,9 @@ esac
 if [ "${RPB_AA:-0}" = 1 ] && [ "$configs" = "rpb aic" ]; then
     configs="rpb rpb-aa"
 fi
+case " $configs " in
+    *" aic "*) [ -d "$aic" ] || { echo "AIC checkout $aic does not exist" >&2; exit 2; } ;;
+esac
 
 heartbeat=/run/rpb/heartbeat
 applied=""
@@ -46,11 +50,12 @@ cleanup() {
     fi
     if [ -n "${beat_pid:-}" ]; then
         kill "$beat_pid" 2>/dev/null || true
+        rm -f "$heartbeat"
     fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
-if [ -e "$heartbeat" ]; then
+if [ -d /run/rpb ]; then
     touch "$heartbeat" || { echo "cannot touch $heartbeat; the dead-man switch would power the host off" >&2; exit 1; }
     ( while sleep 60; do touch "$heartbeat"; done ) &
     beat_pid=$!

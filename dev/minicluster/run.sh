@@ -224,7 +224,7 @@ test_all() {
 
     # 3. zot layer cache: the compile step of THIS run (its sources embed this probe)
     tags=$(curl -fsS "$zot_url/v2/rpb/cache/tags/list") || fail "zot API not reachable"
-    echo "$tags" | grep -q '"toy-gfx942-rocm10.0.0-py3.12"' || fail "zot has no toy cache tag: $tags"
+    grep -q '"toy-gfx942-rocm10.0.0-py3.12"' <<< "$tags" || fail "zot has no toy cache tag: $tags"
     docker buildx prune --builder "$b2" -af >/dev/null
     toy c3-nozot "$b2" "$probe" "$strict" --var CACHE_REGISTRY= || fail "toy build on builder2 without zot"
     nozot=$(step_cached "$b2" "$(ref_of "$b2" "rpb/toy/gfx942/c3-nozot-$probe")" "rpb-sccache-run toy")

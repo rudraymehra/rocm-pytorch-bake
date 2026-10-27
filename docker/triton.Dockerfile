@@ -19,6 +19,7 @@ RUN --mount=type=bind,from=src,target=/w/triton,rw \
     cd /w/triton \
     && if [ ! -f setup.py ]; then cd python; fi \
     && export TRITON_BUILD_WITH_CCACHE=OFF MAX_JOBS="${MAX_JOBS}" \
+              TRITON_APPEND_CMAKE_ARGS="-DTRITON_BUILD_UT=OFF" \
               CMAKE_C_COMPILER_LAUNCHER=sccache CMAKE_CXX_COMPILER_LAUNCHER=sccache \
               SCCACHE_CACHE_SIZE=10G \
     && rpb-sccache-run triton -- python3 setup.py bdist_wheel --dist-dir=/out \

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Generate the Valkey ACL file for the cache node and the sccache secret file for
-# the builders. Passwords never enter git, a Dockerfile, a build arg or a layer.
+# the clients (bake sends it to the build steps as a BuildKit secret). Passwords never enter git, a Dockerfile, a build arg or a layer.
 #
 #   infra/cache-node/make-secrets.sh <cache-node-ip> <out-dir>
 #

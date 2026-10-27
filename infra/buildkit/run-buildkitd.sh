@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Start (or restart) the BuildKit daemon on THIS build machine.
 #
-#   sudo ZOT_ADDR=zot.lan:5000 STATE_DIR=/nvme/buildkit CERT_DIR=secrets/certs/daemon/$(hostname -f) \
+#   sudo ZOT_ADDR=zot.lan:5000 STATE_DIR=/nvme/buildkit CERT_DIR=secrets/certs/daemon/<name given to make-certs.sh> \
 #        infra/buildkit/run-buildkitd.sh
 #
 # The daemon runs as the pinned moby/buildkit image, rootful, on the host network
@@ -19,6 +19,7 @@ conf_dir=/etc/buildkit
 for f in cert.pem key.pem ca.pem; do
     [ -f "$CERT_DIR/$f" ] || { echo "missing $CERT_DIR/$f" >&2; exit 1; }
 done
+install -d -m 0711 "$STATE_DIR"
 fstype=$(df --output=fstype "$STATE_DIR" | tail -1)
 case "$fstype" in
     nfs*|cifs|smb*|fuse*) echo "STATE_DIR is on $fstype; BuildKit state must be on a local filesystem" >&2; exit 1 ;;

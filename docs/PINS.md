@@ -50,6 +50,22 @@ every file listed.
 
 New pins are taken at least two weeks after their release.
 
+## Downloads the upstream builds make themselves
+
+Some components fetch more during their own compile step. These are pinned by the
+upstream source at our pinned commit, not by this repository, and the builders
+need internet access for them:
+
+| Component | Fetches | Pinned by |
+|---|---|---|
+| Triton | prebuilt LLVM (about 370 MB), nlohmann/json, NVIDIA toolchain archives for the CUDA backend | `python/build_helpers.py` and the JSON files next to it; LLVM is checked against `llvm-info.json`. Kept in the `rpb-triton-downloads` cache mount. C++ unit tests (googletest) are switched off |
+| torch | AOTriton: the kernel images for the target gfx (sha256 in `cmake/External/aotriton.cmake`), and the AOTriton runtime source, which is built from source because torch has no prebuilt runtime for the SDK's HIP 7.15; that build installs its Python requirements unpinned | `cmake/External/aotriton.cmake` |
+| ROCm SDK | `rocm==<version>` is a source package built at install time; the SDK wheels are pinned by version, not hash | `ROCM_SDK_VERSION` |
+
+Python packages that no constraint names (build tools in `base`, vLLM and LMCache
+requirements, the test stage) resolve to the newest release at build time, so two
+builds a week apart can differ. `test/constraints.txt` records what was used.
+
 ## Bumping a source pin
 
 1. Change `<NAME>_REF` and `<NAME>_SHA` together (and `<NAME>_VERSION` where it exists).

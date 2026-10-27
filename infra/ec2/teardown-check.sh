@@ -34,7 +34,7 @@ regions=$(aws_q ec2 describe-regions --query 'Regions[].RegionName' --output tex
 
 for r in $regions; do
     ids=$(aws_q ec2 describe-instances --region "$r" --filters "$filter" \
-        Name=instance-state-name,Values=pending,running,stopping,stopped \
+        Name=instance-state-name,Values=pending,running,shutting-down,stopping,stopped \
         --query 'Reservations[].Instances[].InstanceId' --output text)
     report "$r" instance "$ids"
     ids=$(aws_q ec2 describe-volumes --region "$r" --filters "$filter" \

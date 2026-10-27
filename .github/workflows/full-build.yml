@@ -26,7 +26,8 @@ jobs:
   build:
     if: vars.RPB_SELF_HOSTED == 'true'
     runs-on: [self-hosted, linux, x64, rpb-builder]
-    timeout-minutes: 300
+    # A cold build on a small host takes many hours; RPB_TIMEOUT_MINUTES overrides this.
+    timeout-minutes: ${{ fromJSON(vars.RPB_TIMEOUT_MINUTES || '600') }}
     environment: self-hosted
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,10 +42,13 @@ jobs:
           RPB_TEXTFILE_DIR: ${{ vars.RPB_TEXTFILE_DIR }}
           CACHE_REGISTRY: ${{ vars.RPB_CACHE_REGISTRY }}
           SCCACHE_ENV_FILE: ${{ vars.RPB_SCCACHE_ENV_FILE }}
-          # checkout removes the gitignored docker-bake.override.hcl, so site values come from variables
+          # checkout removes the gitignored rpb.env, so site values come from variables
           MAX_JOBS: ${{ vars.RPB_MAX_JOBS }}
           FANOUT_JOBS: ${{ vars.RPB_FANOUT_JOBS }}
         run: |
+          for v in BUILDER CACHE_REGISTRY SCCACHE_ENV_FILE; do
+            if [ -z "${!v}" ]; then echo "::error::repository variable RPB_$v is not set"; exit 2; fi
+          done
           site=()
           if [ -n "$MAX_JOBS" ]; then site+=(--var "MAX_JOBS=$MAX_JOBS"); fi
           if [ -n "$FANOUT_JOBS" ]; then site+=(--var "FANOUT_JOBS=$FANOUT_JOBS"); fi

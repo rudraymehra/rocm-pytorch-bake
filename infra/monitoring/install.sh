@@ -11,6 +11,7 @@ set -euo pipefail
 : "${RPB_CLIENTS:?set RPB_CLIENTS to the space-separated hosts that run scripts/rpb}"
 : "${PROM_DATA:?set PROM_DATA to a data directory}"
 here=$(cd "$(dirname "$0")" && pwd)
+docker compose version >/dev/null 2>&1 || { echo "needs Docker Compose v2 (\"docker compose\"), see docs/OPERATIONS.md" >&2; exit 1; }
 
 targets=""
 for h in $RPB_CLIENTS; do targets="${targets:+$targets, }\"$h:9100\""; done

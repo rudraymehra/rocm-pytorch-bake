@@ -35,3 +35,8 @@ the patch is removed and a `<scenario>-revert` run must be fully cached.
 - No claim smaller than 5%; significance claims need 4–5 repetitions per side.
 - On EC2, `bench/run-matrix.sh` touches the dead-man heartbeat every minute while
   it runs; if the harness dies, the host powers itself off 30 minutes later.
+- Run it as `sudo -E bench/run-matrix.sh ...` with `ZOT_ADDR`, `SECRETS`,
+  `STATE_DIR`, `CACHE_DATA` and `CERT_DIR` set to the values used at install time;
+  it checks all five before the first run.
+- One C0 repetition (rpb cold plus AIC cold) can take most of a session even on
+  64 cores: plan one repetition per launch, or raise `MAX_HOURS`.
