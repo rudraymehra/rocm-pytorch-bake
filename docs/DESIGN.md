@@ -15,7 +15,7 @@ This document lays out the proposed design, the evidence behind each choice, and
 
 ## 2. Goals and non-goals
 
-**Goals**
+### Goals
 
 - G1. Build PyTorch, vLLM and LMCache from source for one gfx target.
 - G2. Fast cold builds; warm builds that rebuild only what changed.
@@ -25,7 +25,7 @@ This document lays out the proposed design, the evidence behind each choice, and
 - G6. Reproducible benchmarks on rented EC2 hardware.
 - G7. CI and documentation from the start.
 
-**Non-goals (v1)**
+### Non-goals (v1)
 
 - Multi-arch fat wheels.
 - Runtime or inference performance; this is about build time and artifact size only.
@@ -58,7 +58,7 @@ Nobody has published a sccache hit rate or a cold/warm breakdown for a ROCm PyTo
 
 ### 4.1 Top-level bake file and pins
 
-```
+```text
 docker-bake.hcl            the one top-level file: pins, knobs, functions, targets, groups
 docker-bake.override.hcl   per site, gitignored: zot address, Redis secret file, MAX_JOBS
 docker/*.Dockerfile        one per component
@@ -77,7 +77,7 @@ buildkit/buildkitd.toml    shared builder config (Section 4.5)
 - Sources are fetched with `ADD --checksum=<sha> <git url>`. The build fails if a tag and SHA disagree, and BuildKit fetches submodules itself. This also covers AIC issue #143 (re-cloning on every build).
 - Each version `ARG` is declared only in the stage that uses it, so changing one pin does not invalidate unrelated stages.
 - A single pin hash goes into image tags and the run record, but **not** into cache refs, so a pin bump still finds the previous cache.
-- Patches live under `patches/<package>-<version>/`.
+- Patches live under `patches/<package>/` and are applied in file-name order.
 - vLLM is pinned to a commit that includes PR #62475, which splits the slow attention compile into parallel units (547 s on one core down to 72 s wall on 12 cores, gfx950).
 - Requires buildx v0.38 or later, for `bake --jobs` (Section 4.2).
 
@@ -85,14 +85,14 @@ A tested sketch of the file (validation, cache functions and the stage matrix pa
 
 ### 4.2 Stage graph
 
-```
+```text
 fetch sources (URL + SHA)
         |
 hipify + patches          (does not depend on the ROCm image)
         |
 torch compile  -> torch wheel
         |
-install-torch image  ----> pushed to zot, used by other machines
+torch-dev image  ----> pushed to zot, used by other machines
         |
    +----+-------+-----------+-----------+
    |            |           |           |
@@ -109,13 +109,13 @@ All wheels exported via FROM scratch stages (type=local)
 - Inside each stage: stable, expensive steps first; patches and scripts last; narrow `COPY` paths.
 - `bake --jobs=defer-error`, so that when one target fails, the others still finish and save their cache. No `parallel=N` limit: buildx rejects limited parallelism when targets are linked through `target:` contexts.
 - Concurrency per machine is bounded twice: BuildKit's `max-parallelism` limits concurrent build steps (Section 4.5), and each target gets an explicit `MAX_JOBS` share for the compiler threads inside its step.
-- **One Dockerfile per component, linked by `target:` contexts.** Your branch uses a single multi-stage Dockerfile, which Docker's docs also prefer. Separate files let each component's cache and owner be independent and let the install-torch image be handed between machines through zot. Either works with this design (Q4).
+- **One Dockerfile per component, linked by `target:` contexts.** Your branch uses a single multi-stage Dockerfile, which Docker's docs also prefer. Separate files let each component's cache and owner be independent and let the torch-dev image be handed between machines through zot. Either works with this design (Q4).
 - Estimated cold time on one 32 to 64 core builder: **40 to 75 minutes**, with torch taking 50 to 80% of it. This is an estimate until measured, and it assumes no AITER kernel prebuild.
 - If AITER kernel prebuild is required, AITER, not torch, may set the critical path. AIC's own patch notes measure 61 minutes for about 107 modules on 128 cores, with a three-module tail running over 85 minutes on its own (`patches/aiter/03-aiter-prebuild-threads.py`, PR #186).
 
 ### 4.3 Compile cache: sccache on Redis
 
-```
+```text
 builder 1 ──┐
 builder 2 ──┼── sccache: L0 local disk (BuildKit cache mount) → L1 Redis on one node
 builder 3 ──┘
@@ -182,7 +182,7 @@ One dependency to note: in BuildKit GC, each rule's size limit is compared with 
 `buildx create --append` picks a node by platform only. When every node is linux/amd64, all work goes to the first node. I confirmed this in `build/resolver/driver.go`. The proposal:
 
 - One builder per machine (Section 4.5), with BuildKit and buildx versions pinned.
-- A thin wrapper that runs separate `bake --builder` invocations. Each target goes back to the machine that built it last, where its cache is warmest. Work moves between machines through zot (the install-torch image) and the shared Redis sccache.
+- A thin wrapper that runs separate `bake --builder` invocations. Each target goes back to the machine that built it last, where its cache is warmest. Work moves between machines through zot (the torch-dev image) and the shared Redis sccache.
 - The wrapper works under Slurm as well: Slurm allocates nodes, the wrapper schedules builds.
 
 **Expected effect, stated plainly.** The chain base → torch → downstream cannot be split, so routing whole targets to more machines speeds up a single cold build by about 1.05× at most (Amdahl estimate). The gains from more machines come from running builds concurrently and from sharing a warm cache: a new machine, or a target landing on a different machine, compiles almost nothing. sccache-dist could add roughly 1.15 to 1.2× on 3 machines if HIP compiles cannot be distributed, and 1.36 to 1.47× if they can. It goes in only if a two-host HIP test passes and it cuts torch cold time by 25% or more.
@@ -201,8 +201,7 @@ One dependency to note: in BuildKit GC, each rule's size limit is compared with 
   - Keep torch headers, which AITER needs to JIT-compile.
 - **Separate wheels:**
   - Our torch gets a unique local version, pinned exactly by both vLLM and LMCache.
-  - Our Triton is pinned in torch's metadata at build time.
-  - We ship `constraints.txt` and `pylock.toml`.
+  - torch does not declare Triton; the shipped `constraints.txt` (exact versions of the tested environment) pins both, and `PIP_CONSTRAINT` protects them during the build.
   - LMCache's NVIDIA-only requirements (`cufile-python`, `nvtx`) are removed from its metadata.
 - **Expected download size for gfx942 (estimates):**
 
@@ -351,7 +350,7 @@ None of these need a GPU.
 
 ## 9. Questions still to be answered
 
-1. **Torch from source:** Do you need torch built from source because you carry PyTorch patches? If so, where do they live? `patches/pytorch/` in AIC is currently empty.
+1. **Torch source:** AIC builds torch from the ROCm/pytorch fork (commit `ec5f3b1`, 2.13 series), while our default is upstream `v2.13.0`, the version vLLM pins for ROCm. Which source should we build, and do you carry patches on top of it? `patches/pytorch/` in AIC is currently empty.
 2. **ROCm base:** TheRock `rocm-sdk` (as in your `buildx-bake` branch) or `/opt/rocm` 7.14 (as in AIC main)? This decides the wheel model and whether `HIP_CLANG_LAUNCHER` is available.
 3. **Target, patches and AITER:** Which gfx target? Which vLLM and LMCache patches must we carry? Is AITER kernel prebuild required? AIC measured about 61 minutes for it, which would put it ahead of torch on the critical path.
 4. **Bake file layout:** One Dockerfile per component linked by `target:` contexts, or your single multi-stage Dockerfile? Should we adopt your variable names (`GPU_ARCH`, `CACHE`, `REGISTRY`) so the two projects match?
