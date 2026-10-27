@@ -1,0 +1,85 @@
+# buildkitd.toml for rocm-pytorch-bake builders (BuildKit v0.34.1).
+#
+# buildkitd ignores unknown keys WITHOUT a warning, so every key here is checked
+# against cmd/buildkitd/config/config.go by `make check-config` (scripts/check-buildkitd-config).
+# Sizes assume a dedicated NVMe filesystem for /var/lib/buildkit; percentages are
+# of that filesystem, measured when the daemon starts.
+#
+# Install as /etc/buildkit/buildkitd.toml on every build machine. The zot address
+# below is replaced by infra/buildkit/install.sh from ZOT_ADDR.
+
+root = "/var/lib/buildkit"
+
+[log]
+  # Only "format" and "level" exist. Step-log limits are the daemon environment
+  # variables BUILDKIT_STEP_LOG_MAX_SIZE / BUILDKIT_STEP_LOG_MAX_SPEED (run-buildkitd.sh).
+  format = "json"
+  level  = "info"
+
+[grpc]
+  address = ["tcp://0.0.0.0:1234"]
+  # Prometheus /metrics and pprof, no authentication: bind to the management address only.
+  # debugAddress = "MGMT_IP:6060"
+  [grpc.tls]
+    cert = "/etc/buildkit/certs/cert.pem"
+    key  = "/etc/buildkit/certs/key.pem"
+    # Setting ca makes the daemon require and verify client certificates (mTLS).
+    # Required: build steps share the host network and can reach this port.
+    ca   = "/etc/buildkit/certs/ca.pem"
+
+[history]
+  # Set BOTH fields. A [history] section with one field missing treats it as zero.
+  # A record is deleted only when it is past BOTH limits.
+  maxAge     = "720h"
+  maxEntries = 500
+
+[worker.oci]
+  enabled         = true
+  snapshotter     = "overlayfs"
+  # Concurrent build steps across all builds on this daemon. Compiler threads
+  # inside a step are set separately (MAX_JOBS / FANOUT_JOBS in docker-bake.hcl).
+  max-parallelism = 8
+  gc              = true
+
+  # Rules run in order after builds (at most once a minute) and at startup.
+  # Each rule's size limit is compared with the TOTAL cache, not only the rows it matches,
+  # so the sccache local level is capped by sccache itself (SCCACHE_CACHE_SIZE).
+
+  # 1. Build contexts and git checkouts: cheap to fetch again.
+  [[worker.oci.gcpolicy]]
+    filters      = ["type==source.local", "type==source.git.checkout"]
+    keepDuration = "72h"
+
+  # 2. Layers go first under pressure: zot can restore them.
+  [[worker.oci.gcpolicy]]
+    filters      = ["type==regular"]
+    maxUsedSpace = "50%"
+    minFreeSpace = "25%"
+
+  # 3. Cache mounts (sccache local level, pip, apt, cargo) are never exported to zot,
+  #    so keep them for 30 days and only trim them above 70%.
+  [[worker.oci.gcpolicy]]
+    filters      = ["type==exec.cachemount"]
+    keepDuration = "720h"
+    maxUsedSpace = "70%"
+
+  # 4. Backstop over every unshared record.
+  [[worker.oci.gcpolicy]]
+    reservedSpace = "10%"
+    maxUsedSpace  = "75%"
+    minFreeSpace  = "15%"
+
+  # 5. Last resort, including internal and frontend records.
+  [[worker.oci.gcpolicy]]
+    all           = true
+    reservedSpace = "10%"
+    maxUsedSpace  = "80%"
+    minFreeSpace  = "10%"
+
+[worker.containerd]
+  enabled = false
+
+[registry."ZOT_ADDR"]
+  # zot is plain HTTP on the LAN. Do not also set insecure = true (that means HTTPS
+  # with an unverified certificate).
+  http = true

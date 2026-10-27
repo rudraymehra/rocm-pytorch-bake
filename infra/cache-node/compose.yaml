@@ -1,0 +1,23 @@
+# The cache node: zot (layer cache) and Valkey (shared sccache level) on one host.
+#   CACHE_DATA=/nvme/cache docker compose -f infra/cache-node/compose.yaml up -d
+# Both services use the host network and must be reachable from the builders only
+# (firewall: allow 5000/tcp and 6379/tcp from the builder addresses).
+name: rpb-cache
+
+services:
+  zot:
+    image: ghcr.io/project-zot/zot:v2.1.22@sha256:96cda11459ce6f8c60da3b03f03e9f67fd11b3ae2d82c4c04c92b3c608996080
+    command: ["serve", "/etc/zot/config.json"]
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./zot-config.json:/etc/zot/config.json:ro
+      - ${CACHE_DATA:?set CACHE_DATA to a directory on local NVMe}/zot:/var/lib/registry
+
+  valkey:
+    image: valkey/valkey:9.1.2@sha256:418652cfb58ef879d4978c33553735d7147016032d5aefaa14c828e611eb9dfd
+    command: ["valkey-server", "/etc/valkey/valkey.conf"]
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ${VALKEY_CONF_DIR:?set VALKEY_CONF_DIR to the directory holding valkey.conf and users.acl}:/etc/valkey:ro
