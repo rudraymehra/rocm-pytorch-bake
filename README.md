@@ -27,6 +27,7 @@ Wheels land in `out/<gfx>/<package>/`, and every run is recorded in
 | Change a version | [docs/PINS.md](docs/PINS.md) |
 | Understand the numbers | [docs/TELEMETRY.md](docs/TELEMETRY.md), [docs/BENCHMARKING.md](docs/BENCHMARKING.md) |
 | CI tiers | [docs/CI.md](docs/CI.md) |
+| Check it yourself, and what is not proven yet | [docs/TESTING.md](docs/TESTING.md) |
 | Why it is built this way | [docs/adr/](docs/adr/) |
 
 ## Requirements
