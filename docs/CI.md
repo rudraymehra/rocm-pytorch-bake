@@ -2,8 +2,9 @@
 
 | Tier | Trigger | Where | What |
 |---|---|---|---|
-| T0 static | every PR and push to `main` or `dev` | GitHub-hosted | bake parse and validation, BuildKit checks, hadolint, shellcheck, actionlint, markdownlint, links, typos, telemetry tests, pin check, buildkitd.toml check |
+| T0 static | every PR and push to `main` or `dev` | GitHub-hosted | bake parse and validation, BuildKit checks, hadolint, shellcheck, actionlint, markdownlint, links, typos, telemetry tests, pin check, buildkitd.toml check, Prometheus config check |
 | T1 smoke | every PR and push to `main` or `dev` | GitHub-hosted | a linked bake pair exports its cache to a real zot, then an empty builder must reuse it |
+| T1 mini-cluster | every PR and push to `main` or `dev` | GitHub-hosted | `make minicluster-test`: two mTLS builders, zot, Valkey, node-exporter and Prometheus; the 7 checks of `dev/minicluster/run.sh`, each with a negative control |
 | T2 full build | manual or nightly | self-hosted builder | `scripts/rpb build`, results uploaded as an artifact |
 | T3 benchmark | manual | EC2 | `bench/run-matrix.sh`, teardown check |
 

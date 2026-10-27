@@ -80,6 +80,36 @@ jobs:
         working-directory: tools/check-buildkitd-config
         run: go run . ../../infra/buildkit/buildkitd.toml
 
+      - name: Prometheus config is valid once rendered
+        run: |
+          sed -e 's/RPB_CLIENT_TARGETS/"client:9100"/' -e 's/ZOT_ADDR/zot:5000/' infra/monitoring/prometheus.yml \
+            | docker run --rm -i --entrypoint promtool prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e check config /dev/stdin
+
+  minicluster:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.38.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Two builders, zot, Valkey and Prometheus; 7 checks with negative controls
+        run: make minicluster-test
+
+      - name: Logs of the failed check
+        if: failure()
+        run: |
+          tail -n 100 dev/minicluster/.state/logs/*.log || true
+          docker compose -f dev/minicluster/compose.yaml logs --tail 50 || true
+
   smoke:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
