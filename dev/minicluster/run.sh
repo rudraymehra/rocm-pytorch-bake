@@ -181,7 +181,7 @@ test_all() {
 
     # 1. mTLS and identity
     node1=$(node_of "$b1") node2=$(node_of "$b2")
-    [ -n "$node1" ] && [ -n "$node2" ] || fail "could not read the daemons' host names"
+    if [ -z "$node1" ] || [ -z "$node2" ]; then fail "could not read the daemons' host names"; fi
     [ "$node1" != "$node2" ] || fail "both builder names reach the same daemon ($node1)"
     [ "$node1" = "$(docker inspect -f '{{.Config.Hostname}}' rpb-mini-builder1-1)" ] || fail "builder1 is not the builder1 container"
     [ "$node2" = "$(docker inspect -f '{{.Config.Hostname}}' rpb-mini-builder2-1)" ] || fail "builder2 is not the builder2 container"
