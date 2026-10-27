@@ -64,7 +64,8 @@ up() {
     cp "$state/certs/daemon/localhost/"{cert,key,ca}.pem "$state/buildkit/certs/"
     sed 's/ZOT_ADDR/zot:5000/' infra/buildkit/buildkitd.toml > "$state/buildkit/buildkitd.toml"
     infra/cache-node/make-secrets.sh 10.231.0.10 "$state/secrets" >/dev/null   # valkey, fixed in compose.yaml
-    cp "$state/secrets/users.acl" "$state/valkey/users.acl"
+    # Valkey runs as its own user in the container; Linux enforces the file mode (Docker Desktop does not).
+    install -m 0644 "$state/secrets/users.acl" "$state/valkey/users.acl"
     # strict: a Redis fallback fails the step; badpw: strict with a wrong password
     { cat "$state/secrets/sccache.env"; echo "RPB_SCCACHE_REQUIRE_REMOTE=1"; } > "$state/secrets/sccache-strict.env"
     sed 's/^SCCACHE_REDIS_PASSWORD=.*/SCCACHE_REDIS_PASSWORD=wrong/' "$state/secrets/sccache-strict.env" \
