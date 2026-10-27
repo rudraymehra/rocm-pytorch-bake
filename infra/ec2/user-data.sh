@@ -3,13 +3,15 @@
 # Installs Docker and buildx v0.38.1, mounts the data volume at /nvme, and arms
 # two dead-man switches so a forgotten instance cannot run up a bill:
 #   1. a hard power-off after MAX_HOURS (shutdown behaviour is "terminate")
-#   2. a power-off when /run/rpb/heartbeat is older than 30 minutes
+#   2. a power-off when /run/rpb/heartbeat is older than 30 minutes; bench/run-matrix.sh
+#      touches it every minute while it runs, so this fires when the harness dies
 set -euo pipefail
 MAX_HOURS=5
 
 shutdown -h "+$((MAX_HOURS * 60))" "rpb: hard session limit"
 
-mkdir -p /run/rpb && touch /run/rpb/heartbeat
+# /run/rpb is writable by every user: bench/run-matrix.sh runs as the login user.
+mkdir -p /run/rpb && chmod 1777 /run/rpb && touch /run/rpb/heartbeat && chmod 0666 /run/rpb/heartbeat
 cat > /usr/local/bin/rpb-heartbeat-check <<'SH'
 #!/bin/sh
 f=/run/rpb/heartbeat

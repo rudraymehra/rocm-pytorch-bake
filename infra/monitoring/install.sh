@@ -21,7 +21,8 @@ install -d -m 0755 "$PROM_CONF_DIR"
 install -d -m 0755 -o 65534 -g 65534 "$PROM_DATA"
 sed -e "s/RPB_CLIENT_TARGETS/$targets/" -e "s/ZOT_ADDR/$ZOT_ADDR/" "$here/prometheus.yml" > "$PROM_CONF_DIR/prometheus.yml"
 
-docker compose -f "$here/compose.yaml" --profile server up -d
+# --force-recreate: a changed prometheus.yml is a bind mount that "up -d" does not pick up.
+docker compose -f "$here/compose.yaml" --profile server up -d --force-recreate
 for _ in $(seq 1 30); do
     if curl -fsS http://127.0.0.1:9090/-/ready >/dev/null 2>&1; then
         break

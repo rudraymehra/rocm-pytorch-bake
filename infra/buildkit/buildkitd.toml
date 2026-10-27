@@ -1,12 +1,15 @@
 # buildkitd.toml for rocm-pytorch-bake builders (BuildKit v0.34.1).
 #
 # buildkitd ignores unknown keys WITHOUT a warning, so every key here is checked
-# against cmd/buildkitd/config/config.go by `make check-config` (scripts/check-buildkitd-config).
+# against cmd/buildkitd/config/config.go by `make check-config` (tools/check-buildkitd-config).
 # Sizes assume a dedicated NVMe filesystem for /var/lib/buildkit; percentages are
-# of that filesystem, measured when the daemon starts.
+# of that filesystem, measured when the daemon starts (BuildKit rounds them to whole
+# GiB, so the effective limits are slightly lower than written).
 #
 # Install as /etc/buildkit/buildkitd.toml on every build machine. The zot address
-# below is replaced by infra/buildkit/install.sh from ZOT_ADDR.
+# below is replaced by infra/buildkit/run-buildkitd.sh from ZOT_ADDR, which must be
+# the same host:port string as CACHE_REGISTRY in the bake (otherwise BuildKit uses
+# HTTPS for zot and the cache export fails, silently because of ignore-error=true).
 
 root = "/var/lib/buildkit"
 
@@ -29,9 +32,10 @@ root = "/var/lib/buildkit"
 
 [history]
   # Set BOTH fields. A [history] section with one field missing treats it as zero.
-  # A record is deleted only when it is past BOTH limits.
-  maxAge     = "720h"
-  maxEntries = 500
+  # A record is deleted only when it is past BOTH limits. Records keep the full step
+  # logs (BUILDKIT_STEP_LOG_MAX_SIZE=-1) outside the build-cache GC, so both are kept small.
+  maxAge     = "336h"
+  maxEntries = 200
 
 [worker.oci]
   enabled         = true
@@ -42,28 +46,28 @@ root = "/var/lib/buildkit"
   gc              = true
 
   # Rules run in order after builds (at most once a minute) and at startup.
-  # Each rule's size limit is compared with the TOTAL cache, not only the rows it matches,
-  # so the sccache local level is capped by sccache itself (SCCACHE_CACHE_SIZE).
+  # A rule's size limits are compared with the TOTAL cache, but it deletes only the
+  # records its filters match, least recently used first. A size limit on a filtered
+  # rule would therefore delete all of that type whenever the OTHER types are large,
+  # so rules 1-3 expire by age only, and size is handled by rules 4-5 over every record.
+  # The sccache local level is also capped by sccache itself (SCCACHE_CACHE_SIZE).
 
-  # 1. Build contexts and git checkouts: cheap to fetch again.
+  # 1. Build contexts and git checkouts unused for 3 days: cheap to fetch again.
   [[worker.oci.gcpolicy]]
     filters      = ["type==source.local", "type==source.git.checkout"]
     keepDuration = "72h"
 
-  # 2. Layers go first under pressure: zot can restore them.
+  # 2. Layers unused for 14 days: zot can restore them.
   [[worker.oci.gcpolicy]]
     filters      = ["type==regular"]
-    maxUsedSpace = "50%"
-    minFreeSpace = "25%"
+    keepDuration = "336h"
 
-  # 3. Cache mounts (sccache local level, pip, apt, cargo) are never exported to zot,
-  #    so keep them for 30 days and only trim them above 70%.
+  # 3. Cache mounts (sccache local level, pip, apt, cargo) unused for 30 days.
   [[worker.oci.gcpolicy]]
     filters      = ["type==exec.cachemount"]
     keepDuration = "720h"
-    maxUsedSpace = "70%"
 
-  # 4. Backstop over every unshared record.
+  # 4. Size backstop over every unshared record, least recently used first.
   [[worker.oci.gcpolicy]]
     reservedSpace = "10%"
     maxUsedSpace  = "75%"

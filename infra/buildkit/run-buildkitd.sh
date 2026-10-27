@@ -40,7 +40,10 @@ docker run -d --name buildkitd --restart=always \
     "$IMAGE" --config /etc/buildkit/buildkitd.toml
 
 for _ in $(seq 1 30); do
-    if docker logs buildkitd 2>&1 | grep -q "running server on"; then
+    # Read the log into a variable: grep -q on a pipe can SIGPIPE docker logs, and
+    # pipefail would turn that into a false "not started".
+    logs=$(docker logs buildkitd 2>&1)
+    if grep -q "running server on" <<< "$logs"; then
         docker exec buildkitd buildctl --version
         echo "buildkitd is up on tcp://$(hostname -f):1234"
         exit 0

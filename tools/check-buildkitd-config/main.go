@@ -2,7 +2,7 @@
 // config struct. buildkitd silently ignores unknown keys, so a typo would turn a
 // setting off without any error; this tool turns that into a CI failure.
 //
-//	go run ./tools/check-buildkitd-config infra/buildkit/buildkitd.toml
+//	cd tools/check-buildkitd-config && go run . ../../infra/buildkit/buildkitd.toml   (make check-config)
 package main
 
 import (

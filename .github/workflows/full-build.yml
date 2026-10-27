@@ -1,6 +1,8 @@
-# Tier T2: the full build on a self-hosted builder. Never runs for pull requests:
-# a public repository must not run untrusted code on self-hosted machines.
+# Tier T2: the full build on a self-hosted builder. Never runs for pull requests.
 # Enabled only when the repository variable RPB_SELF_HOSTED is "true".
+# Keeping this file off pull requests does not protect the runner by itself: a fork
+# could add its own workflow that targets the same labels. docs/CI.md lists the
+# repository settings that must be in place before a runner is registered.
 name: full-build
 
 on:
@@ -39,9 +41,15 @@ jobs:
           RPB_TEXTFILE_DIR: ${{ vars.RPB_TEXTFILE_DIR }}
           CACHE_REGISTRY: ${{ vars.RPB_CACHE_REGISTRY }}
           SCCACHE_ENV_FILE: ${{ vars.RPB_SCCACHE_ENV_FILE }}
+          # checkout removes the gitignored docker-bake.override.hcl, so site values come from variables
+          MAX_JOBS: ${{ vars.RPB_MAX_JOBS }}
+          FANOUT_JOBS: ${{ vars.RPB_FANOUT_JOBS }}
         run: |
+          site=()
+          if [ -n "$MAX_JOBS" ]; then site+=(--var "MAX_JOBS=$MAX_JOBS"); fi
+          if [ -n "$FANOUT_JOBS" ]; then site+=(--var "FANOUT_JOBS=$FANOUT_JOBS"); fi
           scripts/rpb build --builder "$BUILDER" --scenario "$SCENARIO" --targets "wheels test" -- \
-            --var "CACHE_REGISTRY=$CACHE_REGISTRY" --var "SCCACHE_ENV_FILE=$SCCACHE_ENV_FILE"
+            --var "CACHE_REGISTRY=$CACHE_REGISTRY" --var "SCCACHE_ENV_FILE=$SCCACHE_ENV_FILE" "${site[@]}"
 
       - name: Keep the run record
         if: always()

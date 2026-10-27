@@ -4,7 +4,8 @@
 #   CERT_DIR=secrets/certs/client infra/buildkit/create-builders.sh build1.lan build2.lan
 #   CERT_DIR=... infra/buildkit/create-builders.sh localhost:12341 localhost:12342   # dev mini-cluster
 #
-# Creates builders named rpb-<host> (rpb-<host>-<port> when a port is given).
+# Creates builders named rpb-<short host name> or rpb-<ip with dashes>, plus -<port>
+# when a port is given.
 # Each is a separate builder on purpose: buildx picks a node of a multi-node
 # builder by platform only, so several amd64 nodes in one builder would all
 # receive work on the first node (see docs/DESIGN.md 4.6).
@@ -27,7 +28,11 @@ fi
 for spec in "$@"; do
     host=${spec%%:*}
     port=1234
-    name="rpb-${host%%.*}"
+    if [[ "$host" =~ ^[0-9.]+$ ]]; then
+        name="rpb-${host//./-}"      # 10.0.0.11 -> rpb-10-0-0-11
+    else
+        name="rpb-${host%%.*}"       # build1.lan -> rpb-build1
+    fi
     if [ "$spec" != "$host" ]; then
         port=${spec#*:}
         name="$name-$port"

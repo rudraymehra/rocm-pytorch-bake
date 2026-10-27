@@ -1,5 +1,6 @@
 # The cache node: zot (layer cache) and Valkey (shared sccache level) on one host.
-#   CACHE_DATA=/nvme/cache docker compose -f infra/cache-node/compose.yaml up -d
+# Started by infra/cache-node/install.sh, which renders the Valkey config and sets
+# CACHE_DATA and VALKEY_CONF_DIR.
 # Both services use the host network and must be reachable from the builders only
 # (firewall: allow 5000/tcp and 6379/tcp from the builder addresses).
 name: rpb-cache

@@ -15,12 +15,13 @@ if [ "$#" -lt 2 ]; then
 fi
 out=$1
 shift
+ca_days=3650   # the CA must outlive every certificate it signs, including re-issued ones
 days=825
 umask 077
 mkdir -p "$out/ca" "$out/client" "$out/daemon"
 
 if [ ! -f "$out/ca/key.pem" ]; then
-    openssl req -x509 -newkey rsa:4096 -sha256 -days "$days" -nodes \
+    openssl req -x509 -newkey rsa:4096 -sha256 -days "$ca_days" -nodes \
         -subj "/CN=rocm-pytorch-bake buildkit CA" \
         -addext "basicConstraints=critical,CA:TRUE" \
         -addext "keyUsage=critical,keyCertSign,cRLSign" \
@@ -48,7 +49,11 @@ fi
 for spec in "$@"; do
     IFS=, read -r -a parts <<< "$spec"
     host=${parts[0]}
-    san="DNS:$host"
+    if [[ "$host" =~ ^[0-9.]+$ ]]; then
+        san="IP:$host"
+    else
+        san="DNS:$host"
+    fi
     for ip in "${parts[@]:1}"; do
         san="$san,IP:$ip"
     done

@@ -17,7 +17,8 @@ services:
     restart: unless-stopped
     volumes:
       - /:/host:ro,rslave
-      # scripts/rpb writes here when RPB_TEXTFILE_DIR=/var/lib/rpb/textfile
+      # scripts/rpb writes here when RPB_TEXTFILE_DIR=/var/lib/rpb/textfile; the
+      # directory must be writable by the user that runs scripts/rpb (docs/OPERATIONS.md)
       - /var/lib/rpb/textfile:/textfile:ro
 
   prometheus:
@@ -30,5 +31,6 @@ services:
     network_mode: host
     restart: unless-stopped
     volumes:
-      - ${PROM_CONF_DIR:?set PROM_CONF_DIR to the directory holding the rendered prometheus.yml}:/etc/prometheus:ro
-      - ${PROM_DATA:?set PROM_DATA to a data directory}:/prometheus
+      # Defaults keep "--profile client" usable without these; install.sh always sets them.
+      - ${PROM_CONF_DIR:-/etc/rpb-prometheus}:/etc/prometheus:ro
+      - ${PROM_DATA:-/var/lib/rpb-prometheus}:/prometheus
