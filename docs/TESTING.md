@@ -27,7 +27,7 @@ proven yet. The commands here are the ones CI runs.
 | `hadolint`, `shellcheck`, `py_compile` | Dockerfile, shell and Python script hygiene |
 | `go run .` in `tools/check-buildkitd-config` | `buildkitd.toml` loads with BuildKit's own config code and has no unknown keys (BuildKit ignores unknown keys silently) |
 | `promtool check config` | the Prometheus config is valid once its placeholders are filled |
-| `pytest telemetry/tests` | the telemetry parsers and the Prometheus output, 31 tests; 4 of them on output captured from real BuildKit and sccache runs; CI runs them on Python 3.10 and 3.12 |
+| `pytest telemetry/tests` | the telemetry parsers and the Prometheus output, 35 tests; 4 of them on output captured from real BuildKit and sccache runs; CI runs them on Python 3.10 and 3.12 |
 | `docker buildx bake --print all` | the bake file resolves with every variable validated |
 | `scripts/check-pins` | every pin points at a real commit, live against the git hosts, and every version string matches its tag |
 
