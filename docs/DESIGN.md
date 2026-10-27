@@ -11,7 +11,7 @@
 
 Build PyTorch, vLLM and LMCache (with torchvision, Triton, AITER and FlashAttention) from source for a single AMD GPU target, with the fastest possible cold build, a warm build that reuses nearly everything, and minimal wheels for deployment. The build is driven by one top-level `docker-bake.hcl` and runs on remote BuildKit builders, one per machine, each configured by a shared `buildkitd.toml`. Two caches serve the whole cluster: a zot registry on one node for layer caching, and a Redis-backed sccache on one node for compile caching. Timing and cache hit rates come from BuildKit build history (`docker buildx history`) plus sccache statistics, and go into Prometheus. The repo has CI from the first commit, and the results are benchmarked on EC2 so anyone can reproduce them.
 
-This document describes the design as implemented, the evidence behind each choice, and the questions that are still open. What has been tested, and what has not yet, is in `docs/TESTING.md`.
+This document describes the design as implemented, the evidence behind each choice, and the questions that are still open. No full build of the real wheels has run yet; the end-to-end checks of the infrastructure are listed at the top of `dev/minicluster/run.sh`.
 
 ## 2. Goals and non-goals
 
@@ -288,7 +288,7 @@ GitHub-hosted runners have 4 vCPUs, 16 GB RAM and about 14 GB of free disk, so a
 |---|---|---|---|
 | T0 static | Every PR and push | GitHub-hosted | `bake --print` (parse and variable validation), `bake --list`, `bake --call check` (Dockerfile build checks), hadolint, shellcheck, actionlint, markdownlint, link check, spelling, telemetry tests, the `buildkitd.toml` and Prometheus config checks, and a pin check against the git hosts |
 | T1 smoke | Every PR and push | GitHub-hosted | A tiny linked bake pair that exercises args, `target:` contexts and the zot cache refs, in under a minute |
-| T1 mini-cluster | Every PR and push | GitHub-hosted | Two mTLS builders, zot, Valkey, node-exporter and Prometheus on one runner; 7 end-to-end checks (`docs/TESTING.md`) |
+| T1 mini-cluster | Every PR and push | GitHub-hosted | Two mTLS builders, zot, Valkey, node-exporter and Prometheus on one runner; 8 end-to-end checks (`dev/minicluster/run.sh`) |
 | T2 full build | Manual or nightly | Your cluster: an ephemeral self-hosted runner, or a GitHub runner driving a remote builder over mTLS | `bake --jobs=defer-error all`, wheel export, cache push to zot, telemetry record, import test of the wheels |
 | T3 benchmark | Manual only | EC2, with a teardown step | The ABBA campaign of Section 4.9 |
 
@@ -298,7 +298,7 @@ GitHub-hosted runners have 4 vCPUs, 16 GB RAM and about 14 GB of free disk, so a
   - `docs/DESIGN.md`: this document.
   - `docs/OPERATIONS.md`: setting up builders, zot and Redis, certificates, teardown.
   - `docs/PINS.md`: how to bump a pin.
-  - `docs/TELEMETRY.md`, `docs/BENCHMARKING.md`, `docs/CI.md`, and `docs/TESTING.md` (how to check every claim, and what is not proven yet).
+  - `docs/TELEMETRY.md`, `docs/BENCHMARKING.md`, and `docs/CI.md`.
   - `docs/adr/`: one short record per design decision.
   - `CONTRIBUTING.md` with DCO sign-off, `CODEOWNERS`, and a license matching AIC's MIT.
 

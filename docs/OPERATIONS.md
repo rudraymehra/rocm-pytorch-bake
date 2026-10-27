@@ -2,7 +2,7 @@
 
 How to stand up and run the build cluster. Everything here is scripted; this
 page says which script to run, where, and how to check it worked. These scripts
-have not yet run on a real cluster; the mini-cluster (`docs/TESTING.md`) uses the
+have not yet run on a real cluster; the mini-cluster (`dev/minicluster/run.sh`) uses the
 same config files through Compose, not these scripts.
 
 ## Layout
