@@ -93,8 +93,10 @@ def test_slots_get_their_own_file_and_never_share_a_series(tmp_path):
     # scripts/rpb-cluster: phase A and phase C run on the same builder and scenario.
     rec_a = collect.build_record(make_run(tmp_path))
     rec_c = {**rec_a, "target_set": "test", "targets": {}, "compile_units": {}, "wheels": {}}
-    assert prom.textfile_name(rec_a) == "rpb_C0_rpb-build1_torch-wheel.prom"
-    assert prom.textfile_name({**rec_a, "target_set": "aiter-wheel,fa-wheel"}) == "rpb_C0_rpb-build1_aiter-wheel_fa-wheel.prom"
+    assert prom.textfile_name(rec_a) == "rpb_C0_rpb_gfx942_rpb-build1_torch-wheel.prom"
+    assert prom.textfile_name({**rec_a, "target_set": "aiter-wheel,fa-wheel"}) == \
+        "rpb_C0_rpb_gfx942_rpb-build1_aiter-wheel_fa-wheel.prom"
+    assert prom.textfile_name({**rec_a, "gpu_arch": "gfx950"}) != prom.textfile_name(rec_a)
     assert prom.textfile_name(rec_a) != prom.textfile_name(rec_c)
 
     def samples(rec):
@@ -109,7 +111,7 @@ def test_main_writes_into_the_textfile_dir(tmp_path):
     out = tmp_path / "textfile"
     out.mkdir()
     assert prom.main(["prom", str(run / "record.json"), str(out)]) == 0
-    assert [p.name for p in out.iterdir()] == ["rpb_C0_rpb-build1_torch-wheel.prom"]
+    assert [p.name for p in out.iterdir()] == ["rpb_C0_rpb_gfx942_rpb-build1_torch-wheel.prom"]
 
 
 def test_missing_remote_file_is_reported_as_unknown(tmp_path):
@@ -118,3 +120,43 @@ def test_missing_remote_file_is_reported_as_unknown(tmp_path):
     rec = collect.build_record(run)
     assert rec["compile_units"]["torch"]["remote"] is None
     assert series("rpb_sccache_remote", 1, unit="torch", state="unknown") in prom.render(rec).splitlines()
+
+
+def test_failed_run_keeps_the_last_success_time(tmp_path):
+    run = make_run(tmp_path)
+    collect.main(["collect", str(run)])
+    out = tmp_path / "textfile"
+    out.mkdir()
+    prom.main(["prom", str(run / "record.json"), str(out)])
+    failed = json.loads((run / "record.json").read_text())
+    failed.update(status="failed", t_start=5000.0, t_end=6000.0)
+    (run / "record.json").write_text(json.dumps(failed))
+    prom.main(["prom", str(run / "record.json"), str(out)])
+    lines = next(out.iterdir()).read_text().splitlines()
+    assert series("rpb_run_success", 0) in lines
+    assert series("rpb_run_last_success_timestamp_seconds", 3000.0) in lines
+
+
+def test_telemetry_from_a_cached_layer_is_not_reported_as_this_run(tmp_path):
+    run = make_run(tmp_path)  # meta t_start = 1000
+    (run / "telemetry" / "torch-started.txt").write_text("400\n")
+    rec = collect.build_record(run)
+    assert rec["compile_units"]["torch"]["fresh"] is False
+    assert "rpb_sccache_compiles" not in prom.render(rec)
+    (run / "telemetry" / "torch-started.txt").write_text("1001\n")
+    rec = collect.build_record(run)
+    assert rec["compile_units"]["torch"]["fresh"] is True
+    assert "rpb_sccache_compiles" in prom.render(rec)
+
+
+def test_broken_inputs_do_not_stop_the_record(tmp_path):
+    run = make_run(tmp_path)
+    (run / "telemetry" / "torch-sccache.json").write_text("")      # stats call failed
+    (run / "inspect" / "torch-wheel.json").write_text("ERROR: x")  # history inspect failed
+    rec = collect.build_record(run)
+    assert rec["compile_units"]["torch"]["sccache"] is None
+    assert "torch-sccache.json" in rec["compile_units"]["torch"]["error"]
+    assert rec["targets"]["torch-wheel"]["buildkit"]["status"] == "unknown"
+    text = prom.render(rec)
+    assert series("rpb_run_success", 1) in text.splitlines()
+    assert "rpb_target_duration_seconds" not in text

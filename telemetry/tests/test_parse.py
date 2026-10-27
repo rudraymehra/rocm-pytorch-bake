@@ -48,20 +48,16 @@ def test_parse_rawjson_dedups_vertices_and_times_steps():
     assert stages[1]["duration_s"] == pytest.approx(1800.25)
 
 
-def test_time_weighted_hit_ratio_uses_reference_durations():
-    ref = [
-        {"name": "a", "duration_s": 10.0, "cached": False},
-        {"name": "b", "duration_s": 90.0, "cached": False},
+def test_parse_rawjson_reads_nanosecond_timestamps_and_skips_text_lines():
+    # BuildKit writes 9 fractional digits; Python 3.10 accepts at most 6.
+    lines = [
+        "ERROR: something buildx printed",
+        '{"vertexes":[{"digest":"sha256:a","name":"x","started":"2026-10-27T14:53:41.324758833Z",'
+        '"completed":"2026-10-27T14:53:43.824758999+00:00"}]}',
     ]
-    now = [
-        {"name": "a", "duration_s": 10.0, "cached": False},
-        {"name": "b", "duration_s": 0.0, "cached": True},
-    ]
-    assert collect.time_weighted_hit_ratio(now, ref) == pytest.approx(0.9)
-
-
-def test_time_weighted_hit_ratio_without_overlap_is_none():
-    assert collect.time_weighted_hit_ratio([{"name": "x", "duration_s": 1, "cached": True}], []) is None
+    stages = collect.parse_rawjson(lines)
+    assert len(stages) == 1
+    assert stages[0]["duration_s"] == pytest.approx(2.5)
 
 
 def test_parse_sccache_counts_per_language_and_level():
@@ -89,3 +85,8 @@ def test_parse_ninja_log_keeps_last_entry_per_output():
 def test_parse_time_v():
     got = collect.parse_time_v((FIX / "torch-time.txt").read_text())
     assert got == {"user_s": 50000.5, "system_s": 1200.25, "peak_rss_bytes": 4096 * 1024, "exit_status": 0}
+
+
+def test_parse_ninja_log_skips_a_truncated_last_line():
+    text = "# ninja log v5\n0\t1500\t0\ta.o\tdeadbeef\n2000\t25"
+    assert collect.parse_ninja_log(text)["edges"] == 1

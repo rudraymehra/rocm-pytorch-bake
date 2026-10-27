@@ -1,7 +1,12 @@
 """Helpers scripts/rpb uses to find the BuildKit history records of one run.
 
 python3 -m telemetry.runmeta refs <bake-metadata.json|-> <history-ls.json> <run_id>
-    prints "<target>\t<ref-id>" lines; prefers the metadata file, falls back to history ls
+    prints "<target>\t<ref-id>" lines: every record of the run found by name in
+    history ls, with the metadata file's refs taking precedence. The metadata file
+    lists only the targets that finished, so failed targets come from history ls.
+python3 -m telemetry.runmeta refs-since <history-ls.json> <unix-time>
+    prints "<record name>\t<ref-id>" for every record created at or after that time
+    (for builds that do not name their records, such as the AIC baseline)
 python3 -m telemetry.runmeta pins <bake-print.json>
     prints the pinned versions as JSON
 python3 -m telemetry.runmeta outputs <bake-print.json>
@@ -17,7 +22,12 @@ import re
 import sys
 from pathlib import Path
 
-_PIN_ARG = re.compile(r"^(GPU_ARCH|BASE_IMAGE|[A-Z0-9_]+_(REF|SHA|VERSION))$")
+from telemetry.collect import _ts
+
+_PIN_ARG = re.compile(
+    r"^(GPU_ARCH|BASE_IMAGE|PYTHON_VERSION|ROCM_INDEX_URL|TORCH_GIT_URL|RUST_TOOLCHAIN|AITER_PREBUILD"
+    r"|SCCACHE_SHA256|[A-Z0-9_]+_(REF|SHA|VERSION))$"
+)
 
 
 def _ref_id(ref: str) -> str:
@@ -53,6 +63,18 @@ def refs_from_history_ls(text: str, run_id: str) -> dict[str, str]:
     return out
 
 
+def refs_since(text: str, t_start: float) -> dict[str, str]:
+    """Records created at or after t_start (Unix time), keyed by a file-safe name."""
+    out = {}
+    for row in _rows(text):
+        created = row.get("created_at")
+        if not created or _ts(created).timestamp() < t_start:
+            continue
+        name = re.sub(r"[^A-Za-z0-9._-]+", "_", row.get("name") or _ref_id(row["ref"]))
+        out.setdefault(name, _ref_id(row["ref"]))
+    return out
+
+
 def pins_from_bake_print(printed: dict) -> dict[str, str]:
     pins = {}
     for target in printed.get("target", {}).values():
@@ -78,13 +100,19 @@ def wheel_sizes(dirs: list[Path]) -> dict[str, int]:
 def main(argv: list[str]) -> int:
     cmd = argv[1] if len(argv) > 1 else ""
     if cmd == "refs" and len(argv) == 5:
-        refs = {}
+        hist = Path(argv[3])
+        refs = refs_from_history_ls(hist.read_text(), argv[4]) if hist.exists() else {}
         if argv[2] != "-" and Path(argv[2]).exists():
-            refs = refs_from_metadata(json.loads(Path(argv[2]).read_text()))
-        if not refs:
-            refs = refs_from_history_ls(Path(argv[3]).read_text(), argv[4])
+            try:
+                refs.update(refs_from_metadata(json.loads(Path(argv[2]).read_text())))
+            except ValueError:
+                pass  # an unfinished metadata file; history ls already has the records
         for target, ref in sorted(refs.items()):
             print(f"{target}\t{ref}")
+        return 0
+    if cmd == "refs-since" and len(argv) == 4:
+        for name, ref in sorted(refs_since(Path(argv[2]).read_text(), float(argv[3])).items()):
+            print(f"{name}\t{ref}")
         return 0
     if cmd == "pins" and len(argv) == 3:
         print(json.dumps(pins_from_bake_print(json.loads(Path(argv[2]).read_text())), indent=2))

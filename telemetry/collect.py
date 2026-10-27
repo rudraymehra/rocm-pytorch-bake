@@ -4,7 +4,8 @@ Inputs (all written by scripts/rpb into results/<run_id>/):
   meta.json                  run metadata (pins, host, scenario, config)
   inspect/<target>.json      docker buildx history inspect --format json
   steps/<target>.jsonl       docker buildx history logs --progress=rawjson
-  telemetry/<name>-*.{json,txt,log}   sccache stats, /usr/bin/time -v, .ninja_log
+  telemetry/<name>-*.{json,txt,log}   sccache stats and remote state, start time,
+                             /usr/bin/time -v, .ninja_log
   wheels.json                {"<wheel file name>": size_in_bytes}
 
 Usage: python3 -m telemetry.collect results/<run_id>
@@ -13,6 +14,7 @@ Usage: python3 -m telemetry.collect results/<run_id>
 from __future__ import annotations
 
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -42,8 +44,13 @@ def parse_inspect(obj: dict) -> dict:
     }
 
 
+_FRACTION = re.compile(r"(\.\d{6})\d+")
+
+
 def _ts(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    # BuildKit writes nanoseconds; datetime.fromisoformat before Python 3.11 accepts
+    # at most 6 fractional digits (Ubuntu 22.04 ships 3.10).
+    return datetime.fromisoformat(_FRACTION.sub(r"\1", value.replace("Z", "+00:00")))
 
 
 def parse_rawjson(lines: list[str]) -> list[dict]:
@@ -54,7 +61,11 @@ def parse_rawjson(lines: list[str]) -> list[dict]:
         line = line.strip()
         if not line:
             continue
-        for v in json.loads(line).get("vertexes") or []:
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # buildx prints plain-text errors to the same stream
+        for v in obj.get("vertexes") or []:
             digest = v.get("digest")
             if not digest:
                 continue
@@ -77,22 +88,6 @@ def parse_rawjson(lines: list[str]) -> list[dict]:
             "error": v.get("error"),
         })
     return stages
-
-
-def time_weighted_hit_ratio(stages: list[dict], reference: list[dict]) -> float | None:
-    """Share of the reference (cold) step time that this run served from cache.
-
-    Steps are matched by name. Returns None when no step names overlap.
-    """
-    ref_time = {s["name"]: s["duration_s"] or 0.0 for s in reference}
-    total = saved = 0.0
-    for s in stages:
-        if s["name"] not in ref_time:
-            continue
-        total += ref_time[s["name"]]
-        if s["cached"]:
-            saved += ref_time[s["name"]]
-    return _ratio(saved, total)
 
 
 def parse_sccache(obj: dict) -> dict:
@@ -124,7 +119,10 @@ def parse_ninja_log(text: str, top: int = 20) -> dict:
     for line in text.splitlines():
         if not line or line.startswith("#"):
             continue
-        start, end, _mtime, output = line.split("\t")[:4]
+        fields = line.split("\t")
+        if len(fields) < 4 or not fields[0].isdigit() or not fields[1].isdigit():
+            continue  # a line cut off by a killed build
+        start, end, _mtime, output = fields[:4]
         last[output] = (int(start), int(end))
     if not last:
         return {"edges": 0, "span_s": 0.0, "longest": []}
@@ -159,12 +157,31 @@ def _read_json(path: Path):
     return json.loads(path.read_text()) if path.exists() else None
 
 
+def _load(path: Path):
+    """JSON from a file that may be missing, empty or cut off: (value, error)."""
+    try:
+        return json.loads(path.read_text()), None
+    except (OSError, ValueError) as e:
+        return None, f"{path.name}: {e}"
+
+
+# A compile unit is fresh when its step started during this run. Telemetry inside a
+# cached layer belongs to the run that built the layer. The margin covers clock
+# skew between the client and the builder.
+_FRESH_MARGIN_S = 60.0
+
+
 def build_record(run_dir: Path) -> dict:
     meta = _read_json(run_dir / "meta.json") or {}
     targets = {}
     for f in sorted((run_dir / "inspect").glob("*.json")):
         target = f.stem
-        entry = {"buildkit": parse_inspect(json.loads(f.read_text()))}
+        obj, err = _load(f)
+        if obj is None:
+            entry = {"buildkit": {"status": "unknown", "error": f"history inspect unavailable ({err})"}}
+            targets[target] = entry
+            continue
+        entry = {"buildkit": parse_inspect(obj)}
         steps = run_dir / "steps" / f"{target}.jsonl"
         if steps.exists():
             entry["stages"] = parse_rawjson(steps.read_text().splitlines())
@@ -174,10 +191,18 @@ def build_record(run_dir: Path) -> dict:
     tel = run_dir / "telemetry"
     for f in sorted(tel.glob("*-sccache.json")) if tel.exists() else []:
         name = f.name[: -len("-sccache.json")]
-        unit = {"sccache": parse_sccache(json.loads(f.read_text()))}
+        obj, err = _load(f)
+        unit = {"sccache": parse_sccache(obj) if obj is not None else None}
+        if err:
+            unit["error"] = err
         remote = tel / f"{name}-sccache-remote.txt"
         # redis | none | fallback, written by rpb-sccache-run; None for older runs
         unit["remote"] = remote.read_text().strip() if remote.exists() else None
+        started = tel / f"{name}-started.txt"
+        unit["started"] = float(started.read_text()) if started.exists() else None
+        t_start = meta.get("t_start")
+        unit["fresh"] = (unit["started"] >= float(t_start) - _FRESH_MARGIN_S
+                         if unit["started"] is not None and t_start is not None else None)
         time_file = tel / f"{name}-time.txt"
         if time_file.exists():
             unit["time"] = parse_time_v(time_file.read_text())

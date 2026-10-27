@@ -10,9 +10,15 @@ import subprocess
 import sys
 
 targets = sys.argv[1:] or ["all"]
-printed = json.loads(subprocess.run(["docker", "buildx", "bake", "--print", *targets],
-                                    capture_output=True, text=True, check=True).stdout)
-for name, t in sorted(printed["target"].items()):
+proc = subprocess.run(["docker", "buildx", "bake", "--print", *targets], capture_output=True, text=True)
+if proc.returncode != 0:
+    sys.stderr.write(proc.stderr)
+    sys.exit(proc.returncode)
+rows = []
+for name, t in sorted(json.loads(proc.stdout)["target"].items()):
     inputs = sorted(v.removeprefix("target:") for v in (t.get("contexts") or {}).values())
     outputs = [o.get("dest") or o.get("type") for o in t.get("output") or []]
-    print(f"{name:14} {t.get('dockerfile', '-'):28} from: {', '.join(inputs) or '-':45} -> {', '.join(outputs)}")
+    rows.append((name, t.get("dockerfile", "-"), ", ".join(inputs) or "-", ", ".join(outputs)))
+w = [max(len(r[i]) for r in rows) for i in range(3)]
+for name, dockerfile, inputs, outputs in rows:
+    print(f"{name:{w[0]}}  {dockerfile:{w[1]}}  from: {inputs:{w[2]}}  -> {outputs}")

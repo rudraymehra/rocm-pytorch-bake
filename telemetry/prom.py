@@ -6,8 +6,12 @@ scripts/rpb-cluster do not overwrite each other, and the builder and target_set
 labels keep the series of different files apart (node-exporter rejects duplicates).
 run_id and pins appear only on rpb_run_info.
 
+A failed run keeps the slot's previous rpb_run_last_success_timestamp_seconds, so
+"no success for a day" alerts keep working. Compile units whose telemetry came back
+inside a cached layer (fresh is false) are left out.
+
 Usage: python3 -m telemetry.prom results/<run_id>/record.json <textfile-dir>
-       writes <textfile-dir>/rpb_<scenario>_<builder>_<targets>.prom
+       writes <textfile-dir>/rpb_<scenario>_<config>_<gpu_arch>_<builder>_<targets>.prom
 """
 
 from __future__ import annotations
@@ -68,7 +72,7 @@ class _Out:
         return "\n".join(out) + "\n"
 
 
-def render(rec: dict) -> str:
+def render(rec: dict, previous_success: float | None = None) -> str:
     o = _Out({k: rec.get(k, "") for k in COMMON})
     ok = rec.get("status") == "ok"
     if rec.get("t_start") is not None and rec.get("t_end") is not None:
@@ -76,18 +80,22 @@ def render(rec: dict) -> str:
     o.add("rpb_run_success", 1 if ok else 0)
     if ok and rec.get("t_end") is not None:
         o.add("rpb_run_last_success_timestamp_seconds", float(rec["t_end"]))
+    else:
+        o.add("rpb_run_last_success_timestamp_seconds", previous_success)
     pins = rec.get("pins") or {}
     o.add("rpb_run_info", 1, run_id=rec.get("run_id", ""), **{f"pin_{k}": v for k, v in sorted(pins.items())})
 
     for target, t in sorted((rec.get("targets") or {}).items()):
         bk = t["buildkit"]
-        o.add("rpb_target_duration_seconds", bk["duration_s"], target=target)
-        o.add("rpb_buildkit_steps", bk["steps_total"], target=target, state="total")
-        o.add("rpb_buildkit_steps", bk["steps_cached"], target=target, state="cached")
-        o.add("rpb_buildkit_cached_ratio", bk["cached_ratio"], target=target)
+        o.add("rpb_target_duration_seconds", bk.get("duration_s"), target=target)
+        o.add("rpb_buildkit_steps", bk.get("steps_total"), target=target, state="total")
+        o.add("rpb_buildkit_steps", bk.get("steps_cached"), target=target, state="cached")
+        o.add("rpb_buildkit_cached_ratio", bk.get("cached_ratio"), target=target)
 
     for unit, u in sorted((rec.get("compile_units") or {}).items()):
-        sc = u["sccache"]
+        sc = u.get("sccache")
+        if sc is None or u.get("fresh") is False:
+            continue
         for lang in sorted(set(sc["hits"]) | set(sc["misses"])):
             o.add("rpb_sccache_compiles", sc["hits"].get(lang, 0), unit=unit, lang=lang, result="hit")
             o.add("rpb_sccache_compiles", sc["misses"].get(lang, 0), unit=unit, lang=lang, result="miss")
@@ -118,8 +126,15 @@ def write_textfile(text: str, target: Path) -> None:
 
 
 def textfile_name(rec: dict) -> str:
-    slot = "_".join(str(rec.get(k, "")) for k in ("scenario", "builder", "target_set"))
+    slot = "_".join(str(rec.get(k, "")) for k in ("scenario", "config", "gpu_arch", "builder", "target_set"))
     return "rpb_" + re.sub(r"[^A-Za-z0-9.-]+", "_", slot).strip("_") + ".prom"
+
+
+def previous_success(text: str) -> float | None:
+    for line in text.splitlines():
+        if line.startswith("rpb_run_last_success_timestamp_seconds{"):
+            return float(line.rsplit(" ", 1)[1])
+    return None
 
 
 def main(argv: list[str]) -> int:
@@ -127,7 +142,9 @@ def main(argv: list[str]) -> int:
         print("usage: python3 -m telemetry.prom <record.json> <textfile-dir>", file=sys.stderr)
         return 2
     rec = json.loads(Path(argv[1]).read_text())
-    write_textfile(render(rec), Path(argv[2]) / textfile_name(rec))
+    target = Path(argv[2]) / textfile_name(rec)
+    previous = previous_success(target.read_text()) if target.exists() else None
+    write_textfile(render(rec, previous), target)
     return 0
 
 

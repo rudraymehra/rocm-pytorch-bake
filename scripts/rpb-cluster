@@ -4,7 +4,7 @@
 #   scripts/rpb-cluster --builders "rpb-build1 rpb-build2 rpb-build3" --registry zot.lan:5000 \
 #                       [--scenario nightly] [-- <extra docker buildx bake args>]
 #
-#   Phase A  first builder: torch-wheel, triton-wheel and torch-dev; torch-dev is
+#   Phase A  first builder: torch-wheel, triton-wheel, torchvision-wheel and torch-dev; torch-dev is
 #            pushed to zot and its digest recorded.
 #   Phase B  downstream wheels in parallel, each on the builder that built it last
 #            (sticky routes in .rpb-routes), all from torch-dev@digest.
@@ -33,11 +33,15 @@ first=${bl[0]}
 group="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD)"
 common=(--var "CACHE_REGISTRY=$registry" ${extra[@]+"${extra[@]}"})
 
-# Phase A
-scripts/rpb build --builder "$first" --scenario "$scenario" --targets "torch-wheel triton-wheel torch-dev" -- \
+# Phase A. scripts/rpb reports its own results directory, so nothing here guesses
+# which run is "the latest".
+run_dir_file=$(mktemp)
+trap 'rm -f "$run_dir_file"' EXIT
+RPB_RUN_DIR_FILE=$run_dir_file scripts/rpb build --builder "$first" --scenario "$scenario" \
+    --targets "torch-wheel triton-wheel torchvision-wheel torch-dev" -- \
     "${common[@]}" --set "torch-dev.output=type=image,name=$registry/rpb/torch-dev:$group,push=true"
-meta=$(printf '%s\n' results/*/bake-metadata.json | sort | tail -1)
-digest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["torch-dev"]["containerimage.digest"])' "$meta")
+phase_a=$(cat "$run_dir_file")
+digest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["torch-dev"]["containerimage.digest"])' "$phase_a/bake-metadata.json")
 torch_dev="$registry/rpb/torch-dev@$digest"
 echo "torch-dev: $torch_dev"
 
@@ -46,21 +50,25 @@ routes=.rpb-routes
 touch "$routes"
 n=${#bl[@]}
 load=() assign=()
-for i in $(seq 0 $((n - 1))); do load[i]=0; assign[i]=""; done
+for ((i = 0; i < n; i++)); do load[i]=0; assign[i]=""; done
 for t in aiter-wheel fa-wheel lmcache-wheel vllm-wheel; do
     want=$(awk -v t="$t" '$1 == t {print $2}' "$routes")
     pick=-1
-    for i in $(seq 0 $((n - 1))); do [ "${bl[i]}" = "$want" ] && pick=$i; done
+    for ((i = 0; i < n; i++)); do
+        if [ "${bl[i]}" = "$want" ]; then pick=$i; fi
+    done
     if [ "$pick" -lt 0 ]; then
         pick=0
-        for i in $(seq 1 $((n - 1))); do [ "${load[i]}" -lt "${load[pick]}" ] && pick=$i; done
+        for ((i = 1; i < n; i++)); do
+            if [ "${load[i]}" -lt "${load[pick]}" ]; then pick=$i; fi
+        done
     fi
     assign[pick]="${assign[pick]} $t"
     load[pick]=$((load[pick] + 1))
 done
 : > "$routes"
 pids=()
-for i in $(seq 0 $((n - 1))); do
+for ((i = 0; i < n; i++)); do
     [ -n "${assign[i]}" ] || continue
     b=${bl[i]}
     for t in ${assign[i]}; do echo "$t $b" >> "$routes"; done
@@ -77,9 +85,10 @@ if [ "$status" -ne 0 ]; then
 fi
 
 # Phase C: test against the wheels already exported to out/
-gfx=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["GPU_ARCH"])' "$(dirname "$meta")/pins.json")
+gfx=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["GPU_ARCH"])' "$phase_a/pins.json")
 sets=()
-for pair in torch-wheel:torch triton-wheel:triton aiter-wheel:aiter fa-wheel:fa lmcache-wheel:lmcache vllm-wheel:vllm; do
+for pair in torch-wheel:torch triton-wheel:triton torchvision-wheel:torchvision aiter-wheel:aiter fa-wheel:fa \
+        lmcache-wheel:lmcache vllm-wheel:vllm; do
     sets+=(--set "test.contexts.${pair%%:*}=out/$gfx/${pair#*:}")
 done
 scripts/rpb build --builder "$first" --scenario "$scenario" --targets test -- "${common[@]}" "${sets[@]}"
