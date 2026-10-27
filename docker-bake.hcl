@@ -1,11 +1,13 @@
 # rocm-pytorch-bake: build PyTorch, vLLM and LMCache from source for ONE AMD GPU target.
 #
-#   docker buildx bake --list=variables            # every knob, typed and described
+#   docker buildx bake --list=variables            # every variable, typed and described
 #   docker buildx bake --print all                 # resolved config; CI uses this as the validator
 #   docker buildx bake --var GPU_ARCH=gfx950 all   # --var beats environment variables
 #
-# Site-specific values (cache registry, Redis secret file, job counts) belong in a
-# gitignored docker-bake.override.hcl, which bake merges automatically.
+# Site-specific values (cache registry, Redis secret file, job counts) are set as
+# environment variables of the same name (see rpb.env.example) or with --var. Both
+# keep the type and validation below; re-declaring a variable in an override file
+# would replace them.
 # Requires buildx >= 0.38.0 (bake --jobs) and BuildKit >= 0.17.0.
 
 # ---------------------------------------------------------------- target and toolchain
@@ -13,10 +15,11 @@
 variable "GPU_ARCH" {
   type        = string
   default     = "gfx942"
-  description = "Exactly one AMD GPU target, for example gfx942 or gfx950"
+  description = "Exactly one AMD GPU target: gfx90a, gfx942 or gfx950"
   validation {
-    condition     = can(regex("^gfx[0-9a-f]{3,4}$", GPU_ARCH))
-    error_message = "GPU_ARCH must be ONE target like gfx942, not a list."
+    # The CDNA targets that AITER, FlashAttention (allowed_archs) and vLLM's ROCm build support.
+    condition     = contains(["gfx90a", "gfx942", "gfx950"], GPU_ARCH)
+    error_message = "GPU_ARCH must be ONE of gfx90a, gfx942, gfx950 (not a list)."
   }
 }
 
@@ -73,34 +76,64 @@ variable "RUST_TOOLCHAIN" {
 # ---------------------------------------------------------------- source pins (ref + full commit)
 
 variable "TORCH_GIT_URL" {
+  type        = string
   default     = "https://github.com/pytorch/pytorch.git"
   description = "PyTorch source repository; AIC builds from https://github.com/ROCm/pytorch.git (Q1)"
 }
 variable "TORCH_REF" {
-  default = "v2.13.0"
+  type        = string
+  default     = "v2.13.0"
+  description = "PyTorch tag or branch to build"
 }
 variable "TORCH_SHA" {
-  default = "cf30153c4c131c8164ee7798e5022d810682e2cb"
+  type        = string
+  default     = "cf30153c4c131c8164ee7798e5022d810682e2cb"
+  description = "Commit TORCH_REF must resolve to (checked by ADD --checksum and scripts/check-pins)"
 }
 variable "TORCH_VERSION" {
+  type        = string
   default     = "2.13.0"
-  description = "Public torch version; the wheel gets a +rpb local suffix"
+  description = "Public torch version; the wheel is versioned <this>+rpb.<GPU_ARCH>"
 }
 variable "TRITON_REF" {
+  type        = string
   default     = "669b31acc1dd1b3fd93286afd5db67f65d9f7557"
   description = "ROCm/triton commit (release/internal/3.8.x), as pinned by vLLM"
 }
 variable "TRITON_SHA" {
-  default = "669b31acc1dd1b3fd93286afd5db67f65d9f7557"
+  type        = string
+  default     = "669b31acc1dd1b3fd93286afd5db67f65d9f7557"
+  description = "Commit TRITON_REF must resolve to"
+}
+variable "VISION_REF" {
+  type        = string
+  default     = "v0.28.0"
+  description = "torchvision tag; vLLM's ROCm base pairs torch 2.13.0 with torchvision 0.28.0"
+}
+variable "VISION_SHA" {
+  type        = string
+  default     = "8fb87713a24951e639c494b0f2a8a81b5f8e33a6"
+  description = "Commit VISION_REF must resolve to"
+}
+variable "VISION_VERSION" {
+  type        = string
+  default     = "0.28.0"
+  description = "Public torchvision version; the wheel is versioned <this>+rpb.<GPU_ARCH>"
 }
 variable "AITER_REF" {
-  default = "v0.1.26"
+  type        = string
+  default     = "v0.1.26"
+  description = "AITER tag, as pinned by vLLM"
 }
 variable "AITER_SHA" {
-  default = "84077b3c0461dac1f0f3f8b9590a9282e2035a2f"
+  type        = string
+  default     = "84077b3c0461dac1f0f3f8b9590a9282e2035a2f"
+  description = "Commit AITER_REF must resolve to"
 }
 variable "AITER_VERSION" {
-  default = "0.1.26"
+  type        = string
+  default     = "0.1.26"
+  description = "Version written into the AITER wheel (setuptools-scm)"
 }
 variable "AITER_PREBUILD" {
   type        = string
@@ -112,50 +145,65 @@ variable "AITER_PREBUILD" {
   }
 }
 variable "FA_REF" {
-  default = "0e60e39473e8df549a20fb5353760f7a65b30e2d"
+  type        = string
+  default     = "0e60e39473e8df549a20fb5353760f7a65b30e2d"
+  description = "FlashAttention commit, as pinned by vLLM"
 }
 variable "FA_SHA" {
-  default = "0e60e39473e8df549a20fb5353760f7a65b30e2d"
+  type        = string
+  default     = "0e60e39473e8df549a20fb5353760f7a65b30e2d"
+  description = "Commit FA_REF must resolve to"
 }
 variable "LMCACHE_REF" {
-  default = "v0.5.3"
+  type        = string
+  default     = "v0.5.3"
+  description = "LMCache tag, as pinned by vLLM"
 }
 variable "LMCACHE_SHA" {
-  default = "140819c9d57a975dbc5678a6459a218e544cb58b"
+  type        = string
+  default     = "140819c9d57a975dbc5678a6459a218e544cb58b"
+  description = "Commit LMCACHE_REF must resolve to"
 }
 variable "LMCACHE_VERSION" {
-  default = "0.5.3"
+  type        = string
+  default     = "0.5.3"
+  description = "Version written into the LMCache wheel (setuptools-scm)"
 }
 variable "VLLM_REF" {
+  type        = string
   default     = "e8ae84bf7e992c63570905fce3073fd7a7de2412"
   description = "vLLM main at the merge of PR #62475 (split attention TUs)"
 }
 variable "VLLM_SHA" {
-  default = "e8ae84bf7e992c63570905fce3073fd7a7de2412"
+  type        = string
+  default     = "e8ae84bf7e992c63570905fce3073fd7a7de2412"
+  description = "Commit VLLM_REF must resolve to"
 }
 variable "VLLM_VERSION" {
+  type        = string
   default     = "0.32.1rc1.dev195+ge8ae84bf7"
-  description = "PEP 440 version for the vLLM wheel, as setuptools-scm computes it at VLLM_SHA (docs/PINS.md)"
+  description = "PEP 440 version of the vLLM wheel, as vLLM's setup.py computes it at VLLM_SHA (setuptools-scm keeps 9 hex digits; docs/PINS.md)"
   validation {
-    condition     = VLLM_VERSION != ""
-    error_message = "VLLM_VERSION must be set; see docs/PINS.md."
+    condition     = can(regex("\\+g${substr(VLLM_SHA, 0, 9)}$", VLLM_VERSION))
+    error_message = "VLLM_VERSION must end in +g<first 9 hex digits of VLLM_SHA>; see docs/PINS.md."
   }
 }
 
 variable "_SHAS" {
-  default = [TORCH_SHA, TRITON_SHA, AITER_SHA, FA_SHA, LMCACHE_SHA, VLLM_SHA]
+  default     = [TORCH_SHA, TRITON_SHA, VISION_SHA, AITER_SHA, FA_SHA, LMCACHE_SHA, VLLM_SHA]
+  description = "Internal: every *_SHA, for the validation below"
   validation {
     condition     = length([for s in _SHAS : s if !can(regex("^[0-9a-f]{40}$", s))]) == 0
     error_message = "Every *_SHA must be a full 40-character lowercase git commit."
   }
 }
 
-# ---------------------------------------------------------------- site knobs (override file or --var)
+# ---------------------------------------------------------------- site knobs (environment variable or --var)
 
 variable "CACHE_REGISTRY" {
   type        = string
   default     = ""
-  description = "host:port of the zot layer cache; empty disables registry cache"
+  description = "host:port of the zot layer cache, the same string as ZOT_ADDR on the builders; empty disables registry cache"
 }
 variable "CACHE_TAG_SUFFIX" {
   type        = string
@@ -175,19 +223,19 @@ variable "TORCH_DEV_IMAGE" {
 variable "MAX_JOBS" {
   type        = number
   default     = 64
-  description = "Compiler jobs for the torch build"
+  description = "Compiler jobs for the torch build. Part of the layer cache key: use one value per host class"
   validation {
-    condition     = MAX_JOBS > 0
-    error_message = "MAX_JOBS must be positive."
+    condition     = MAX_JOBS > 0 && floor(MAX_JOBS) == MAX_JOBS
+    error_message = "MAX_JOBS must be a positive whole number."
   }
 }
 variable "FANOUT_JOBS" {
   type        = number
   default     = 16
-  description = "Compiler jobs for EACH downstream target (vLLM, LMCache, AITER, FA run in parallel)"
+  description = "Compiler jobs for each of Triton, torchvision, AITER, FA, LMCache and vLLM (several run in parallel)"
   validation {
-    condition     = FANOUT_JOBS > 0
-    error_message = "FANOUT_JOBS must be positive."
+    condition     = FANOUT_JOBS > 0 && floor(FANOUT_JOBS) == FANOUT_JOBS
+    error_message = "FANOUT_JOBS must be a positive whole number."
   }
 }
 variable "RUN_ID" {
@@ -198,18 +246,24 @@ variable "RUN_ID" {
 
 # ---------------------------------------------------------------- helpers
 
+# Cache tags carry everything that changes every layer: target, ROCm and Python.
+function "cache_tag" {
+  params = [name]
+  result = "${CACHE_REGISTRY}/rpb/cache:${name}-${GPU_ARCH}-rocm${ROCM_SDK_VERSION}-py${PYTHON_VERSION}"
+}
+
 function "cache_from" {
   params = [name]
   result = CACHE_REGISTRY == "" ? [] : [
-    "type=registry,ref=${CACHE_REGISTRY}/rpb/cache:${name}-${GPU_ARCH}",
-    "type=registry,ref=${CACHE_REGISTRY}/rpb/cache:${name}-${GPU_ARCH}-ref",
+    "type=registry,ref=${cache_tag(name)}",
+    "type=registry,ref=${cache_tag(name)}-ref",
   ]
 }
 
 function "cache_to" {
   params = [name]
   result = CACHE_REGISTRY == "" ? [] : [
-    "type=registry,ref=${CACHE_REGISTRY}/rpb/cache:${name}-${GPU_ARCH}${CACHE_TAG_SUFFIX},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,compression-level=3,force-compression=true,ignore-error=true",
+    "type=registry,ref=${cache_tag(name)}${CACHE_TAG_SUFFIX},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,compression-level=3,force-compression=true,ignore-error=true",
   ]
 }
 
@@ -224,15 +278,22 @@ target "_common" {
   context = "."
   args = {
     GPU_ARCH         = GPU_ARCH
+    RPB_GFX          = GPU_ARCH
     PYTHON_VERSION   = PYTHON_VERSION
     ROCM_SDK_VERSION = ROCM_SDK_VERSION
   }
   secret = SCCACHE_ENV_FILE == "" ? [] : ["id=sccache_env,src=${SCCACHE_ENV_FILE}"]
 }
 
+# Every real build is x86_64: the ROCm wheels and the sccache binary exist only for it.
+target "_amd64" {
+  inherits  = ["_common"]
+  platforms = ["linux/amd64"]
+}
+
 target "base" {
-  inherits    = ["_common"]
-  description = "Ubuntu + Python + TheRock rocm-sdk ${ROCM_SDK_VERSION} + sccache, no frameworks"
+  inherits    = ["_amd64"]
+  description = "Ubuntu + Python + TheRock rocm-sdk ${ROCM_SDK_VERSION} + sccache + amdsmi, no frameworks"
   dockerfile  = "docker/base.Dockerfile"
   args = {
     BASE_IMAGE          = BASE_IMAGE
@@ -246,7 +307,7 @@ target "base" {
 }
 
 target "torch-wheel" {
-  inherits    = ["_common"]
+  inherits    = ["_amd64"]
   description = "PyTorch ${TORCH_REF} wheel for ${GPU_ARCH}"
   dockerfile  = "docker/torch.Dockerfile"
   target      = "export"
@@ -265,7 +326,7 @@ target "torch-wheel" {
 }
 
 target "triton-wheel" {
-  inherits    = ["_common"]
+  inherits    = ["_amd64"]
   description = "ROCm Triton wheel (no torch dependency, starts right after base)"
   dockerfile  = "docker/triton.Dockerfile"
   target      = "export"
@@ -281,14 +342,52 @@ target "triton-wheel" {
   output     = ["type=local,dest=out/${GPU_ARCH}/triton"]
 }
 
-target "torch-dev" {
-  inherits    = ["_common"]
-  description = "base + our torch and triton wheels installed; parent of every downstream build"
+target "torch-core" {
+  inherits    = ["_amd64"]
+  description = "base + our torch and triton wheels installed; torchvision is built on it"
   dockerfile  = "docker/torch-dev.Dockerfile"
+  target      = "torch-core"
   contexts = {
     base         = "target:base"
     torch-wheel  = "target:torch-wheel"
     triton-wheel = "target:triton-wheel"
+  }
+  args = {
+    BUILDKIT_BUILD_NAME = "rpb/torch-core/${GPU_ARCH}/${RUN_ID}"
+  }
+  cache-from = cache_from("torch-core")
+  cache-to   = cache_to("torch-core")
+  output     = ["type=cacheonly"]
+}
+
+target "torchvision-wheel" {
+  inherits    = ["_amd64"]
+  description = "torchvision ${VISION_REF} wheel built against our torch"
+  dockerfile  = "docker/torchvision.Dockerfile"
+  target      = "export"
+  contexts    = { torch-core = "target:torch-core" }
+  args = {
+    VISION_REF          = VISION_REF
+    VISION_SHA          = VISION_SHA
+    VISION_VERSION      = VISION_VERSION
+    MAX_JOBS            = FANOUT_JOBS
+    BUILDKIT_BUILD_NAME = "rpb/torchvision-wheel/${GPU_ARCH}/${RUN_ID}"
+  }
+  cache-from = cache_from("torchvision")
+  cache-to   = cache_to("torchvision")
+  output     = ["type=local,dest=out/${GPU_ARCH}/torchvision"]
+}
+
+target "torch-dev" {
+  inherits    = ["_amd64"]
+  description = "base + our torch, triton and torchvision installed; parent of every downstream build"
+  dockerfile  = "docker/torch-dev.Dockerfile"
+  target      = "torch-dev"
+  contexts = {
+    base              = "target:base"
+    torch-wheel       = "target:torch-wheel"
+    triton-wheel      = "target:triton-wheel"
+    torchvision-wheel = "target:torchvision-wheel"
   }
   args = {
     BUILDKIT_BUILD_NAME = "rpb/torch-dev/${GPU_ARCH}/${RUN_ID}"
@@ -299,7 +398,7 @@ target "torch-dev" {
 }
 
 target "aiter-wheel" {
-  inherits    = ["_common"]
+  inherits    = ["_amd64"]
   description = "AITER ${AITER_REF} wheel, PREBUILD_KERNELS=${AITER_PREBUILD}"
   dockerfile  = "docker/aiter.Dockerfile"
   target      = "export"
@@ -318,8 +417,8 @@ target "aiter-wheel" {
 }
 
 target "fa-wheel" {
-  inherits    = ["_common"]
-  description = "FlashAttention (CK backend) wheel; CDNA targets (gfx9xx) only"
+  inherits    = ["_amd64"]
+  description = "FlashAttention (CK backend) wheel for gfx90a, gfx942 or gfx950"
   dockerfile  = "docker/fa.Dockerfile"
   target      = "export"
   contexts    = { torch-dev = torch_dev_context() }
@@ -335,7 +434,7 @@ target "fa-wheel" {
 }
 
 target "lmcache-wheel" {
-  inherits    = ["_common"]
+  inherits    = ["_amd64"]
   description = "LMCache ${LMCACHE_REF} wheel, separate from vLLM"
   dockerfile  = "docker/lmcache.Dockerfile"
   target      = "export"
@@ -353,8 +452,8 @@ target "lmcache-wheel" {
 }
 
 target "vllm-wheel" {
-  inherits    = ["_common"]
-  description = "vLLM wheel: native extension stage + Python packaging stage"
+  inherits    = ["_amd64"]
+  description = "vLLM wheel: native extension stage + Rust frontend + Python packaging stage"
   dockerfile  = "docker/vllm.Dockerfile"
   target      = "export"
   contexts    = { torch-dev = torch_dev_context() }
@@ -373,17 +472,18 @@ target "vllm-wheel" {
 }
 
 target "test" {
-  inherits    = ["_common"]
+  inherits    = ["_amd64"]
   description = "Install every wheel into a clean image and run the no-GPU checks"
   dockerfile  = "docker/test.Dockerfile"
   contexts = {
-    base          = "target:base"
-    torch-wheel   = "target:torch-wheel"
-    triton-wheel  = "target:triton-wheel"
-    aiter-wheel   = "target:aiter-wheel"
-    fa-wheel      = "target:fa-wheel"
-    lmcache-wheel = "target:lmcache-wheel"
-    vllm-wheel    = "target:vllm-wheel"
+    base              = "target:base"
+    torch-wheel       = "target:torch-wheel"
+    triton-wheel      = "target:triton-wheel"
+    torchvision-wheel = "target:torchvision-wheel"
+    aiter-wheel       = "target:aiter-wheel"
+    fa-wheel          = "target:fa-wheel"
+    lmcache-wheel     = "target:lmcache-wheel"
+    vllm-wheel        = "target:vllm-wheel"
   }
   target = "export"
   args = {
@@ -397,28 +497,32 @@ target "test" {
 # Dockerfile build checks without building. Named contexts point at a tiny pinned
 # image so the check never builds or pulls the real parents.
 target "lint" {
-  name       = "lint-${df}"
-  matrix     = { df = ["base", "torch", "triton", "torch-dev", "aiter", "fa", "lmcache", "vllm", "test"] }
-  dockerfile = "docker/${df}.Dockerfile"
-  call       = "check"
+  name        = "lint-${df}"
+  description = "BuildKit build checks of docker/${df}.Dockerfile (CI)"
+  matrix      = { df = ["base", "torch", "triton", "torch-dev", "torchvision", "aiter", "fa", "lmcache", "vllm", "test"] }
+  dockerfile  = "docker/${df}.Dockerfile"
+  call        = "check"
   # The check still validates ADD flags, and "sha256:" with an empty value is rejected.
   args = { SCCACHE_SHA256 = SCCACHE_SHA256 }
   contexts = {
-    base          = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
-    torch-dev     = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
-    torch-wheel   = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
-    triton-wheel  = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
-    aiter-wheel   = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
-    fa-wheel      = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
-    lmcache-wheel = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
-    vllm-wheel    = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+    base              = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+    torch-core        = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+    torch-dev         = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+    torch-wheel       = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+    triton-wheel      = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+    torchvision-wheel = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+    aiter-wheel       = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+    fa-wheel          = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+    lmcache-wheel     = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+    vllm-wheel        = "docker-image://busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
   }
 }
 
 # A tiny linked pair that exercises args, a target: link and the registry cache
-# functions on a GitHub-hosted runner in under a minute.
+# functions on a GitHub-hosted runner in under a minute. No sccache secret.
 target "smoke-base" {
   inherits          = ["_common"]
+  description       = "CI smoke test: first half of a linked pair, exported to the registry cache"
   dockerfile-inline = "FROM busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e\nARG GPU_ARCH\nRUN echo \"$GPU_ARCH\" > /arch && sleep 2"
   cache-from        = cache_from("smoke-base")
   cache-to          = cache_to("smoke-base")
@@ -427,6 +531,7 @@ target "smoke-base" {
 
 target "smoke" {
   inherits          = ["_common"]
+  description       = "CI smoke test: second half, built from smoke-base through a target: link"
   contexts          = { base = "target:smoke-base" }
   dockerfile-inline = "FROM base\nRUN test -s /arch && cat /arch"
   cache-from        = cache_from("smoke")
@@ -437,14 +542,18 @@ target "smoke" {
 # ---------------------------------------------------------------- groups
 
 group "default" {
-  targets = ["wheels"]
+  description = "Every wheel"
+  targets     = ["wheels"]
 }
 group "wheels" {
-  targets = ["torch-wheel", "triton-wheel", "aiter-wheel", "fa-wheel", "lmcache-wheel", "vllm-wheel"]
+  description = "Every wheel"
+  targets     = ["torch-wheel", "triton-wheel", "torchvision-wheel", "aiter-wheel", "fa-wheel", "lmcache-wheel", "vllm-wheel"]
 }
 group "all" {
-  targets = ["wheels", "test"]
+  description = "Every wheel, then the install-and-test check"
+  targets     = ["wheels", "test"]
 }
 group "downstream" {
-  targets = ["aiter-wheel", "fa-wheel", "lmcache-wheel", "vllm-wheel"]
+  description = "The wheels built from torch-dev (scripts/rpb-cluster phase B)"
+  targets     = ["aiter-wheel", "fa-wheel", "lmcache-wheel", "vllm-wheel"]
 }

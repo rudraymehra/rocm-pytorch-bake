@@ -8,12 +8,17 @@ ARG AITER_SHA
 ADD --keep-git-dir=true --checksum=${AITER_SHA} https://github.com/ROCm/aiter.git#${AITER_REF} /
 
 FROM torch-dev AS build
+# GPU_ARCH (ENV) comes from the torch-dev image, RPB_GFX from this bake: a torch-dev
+# image built for another target (TORCH_DEV_IMAGE) must not be used.
+ARG RPB_GFX
+RUN test "${GPU_ARCH}" = "${RPB_GFX}" \
+    || { echo "torch-dev is for ${GPU_ARCH}, this build is for ${RPB_GFX}" >&2; exit 1; }
 ARG GPU_ARCH
 ARG AITER_VERSION
 ARG AITER_PREBUILD
 ARG MAX_JOBS
 RUN --mount=type=bind,from=src,source=/requirements.txt,target=/tmp/aiter-requirements.txt \
-    --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=locked \
+    --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=shared \
     python3 -m pip install -r /tmp/aiter-requirements.txt pyyaml
 RUN --mount=type=bind,from=src,target=/w/aiter,rw \
     --mount=type=cache,id=rpb-sccache-aiter-${GPU_ARCH},target=/root/.cache/sccache,sharing=locked \

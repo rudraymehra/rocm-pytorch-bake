@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Check that every source pin in docker-bake.hcl is self-consistent.
+"""Check that every source pin in docker-bake.hcl is self-consistent and real.
 
-For each <NAME>_REF / <NAME>_SHA pair: the ref must resolve (git ls-remote) to the
-SHA, or be the SHA itself. Also checks that the Dockerfile fallback BASE_IMAGE
-equals the bake default. Needs network access to the git hosts.
+For each <NAME>_REF / <NAME>_SHA pair:
+  - a tag or branch ref must resolve (git ls-remote) to the SHA;
+  - a ref that is itself a commit must equal the SHA, and the commit must exist in
+    the repository (fetched by hash into a throwaway repository, trees only).
+Versions must match their refs: TORCH/VISION/AITER/LMCACHE_VERSION equal the tag
+without "v", and VLLM_VERSION ends in +g<first 9 hex digits of VLLM_SHA>.
+Also checks that the Dockerfile fallback BASE_IMAGE equals the bake default.
+Needs network access to the git hosts.
 Set BUILDX to override the buildx command (default "docker buildx").
 
     python3 scripts/check-pins
@@ -14,15 +19,18 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 REPOS = {
     "TORCH": "https://github.com/pytorch/pytorch.git",
     "TRITON": "https://github.com/ROCm/triton.git",
+    "VISION": "https://github.com/pytorch/vision.git",
     "AITER": "https://github.com/ROCm/aiter.git",
     "FA": "https://github.com/Dao-AILab/flash-attention.git",
     "LMCACHE": "https://github.com/LMCache/LMCache.git",
     "VLLM": "https://github.com/vllm-project/vllm.git",
 }
+VERSIONED = ("TORCH", "VISION", "AITER", "LMCACHE")
 
 
 def bake_variables() -> dict:
@@ -41,6 +49,19 @@ def resolve(repo: str, ref: str) -> set:
     return {line.split("\t")[0] for line in out.splitlines()}
 
 
+def commit_exists(repo: str, sha: str) -> bool:
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(["git", "init", "-q", "--bare", tmp], check=True)
+        fetched = subprocess.run(
+            ["git", "-C", tmp, "fetch", "-q", "--depth=1", "--filter=tree:0", repo, sha],
+            capture_output=True, text=True,
+        )
+        if fetched.returncode != 0:
+            return False
+        kind = subprocess.run(["git", "-C", tmp, "cat-file", "-t", sha], capture_output=True, text=True)
+        return kind.stdout.strip() == "commit"
+
+
 def main() -> int:
     v = bake_variables()
     bad = 0
@@ -48,11 +69,21 @@ def main() -> int:
     for name, repo in repos.items():
         ref, sha = v[f"{name}_REF"], v[f"{name}_SHA"]
         if re.fullmatch(r"[0-9a-f]{40}", ref):
-            ok = ref == sha
+            ok = ref == sha and commit_exists(repo, sha)
+            how = "commit exists" if ok else "commit missing or ref != sha"
         else:
             ok = sha in resolve(repo, ref)
-        print(f"{'ok ' if ok else 'BAD'} {name}: {ref} -> {sha}")
+            how = "tag resolves" if ok else "ref does not resolve to sha"
+        print(f"{'ok ' if ok else 'BAD'} {name}: {ref} -> {sha} ({how})")
         bad += not ok
+    for name in VERSIONED:
+        ref, version = v[f"{name}_REF"], v[f"{name}_VERSION"]
+        ok = ref.removeprefix("v") == version
+        print(f"{'ok ' if ok else 'BAD'} {name}_VERSION: {version} for {ref}")
+        bad += not ok
+    ok = v["VLLM_VERSION"].endswith(f"+g{v['VLLM_SHA'][:9]}")
+    print(f"{'ok ' if ok else 'BAD'} VLLM_VERSION: {v['VLLM_VERSION']} ends in +g<first 9 of VLLM_SHA>")
+    bad += not ok
     df = open("docker/base.Dockerfile").read()
     m = re.search(r"^ARG BASE_IMAGE=(\S+)$", df, re.M)
     if not m or m.group(1) != v["BASE_IMAGE"]:

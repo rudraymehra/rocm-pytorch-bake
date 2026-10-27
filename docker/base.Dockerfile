@@ -35,8 +35,13 @@ RUN --mount=type=cache,id=rpb-apt-lists,target=/var/lib/apt/lists,sharing=locked
         "python${PYTHON_VERSION}" "python${PYTHON_VERSION}-dev" "python${PYTHON_VERSION}-venv" \
     && update-alternatives --install /usr/bin/python3 python3 "/usr/bin/python${PYTHON_VERSION}" 1 \
     && update-alternatives --set python3 "/usr/bin/python${PYTHON_VERSION}" \
-    && ln -sf /usr/bin/python3 /usr/bin/python \
-    && curl -fsS https://bootstrap.pypa.io/get-pip.py | "python${PYTHON_VERSION}" \
+    && ln -sf /usr/bin/python3 /usr/bin/python
+
+# pip 26.2.1 from its PyPI wheel, verified by sha256; a pip wheel can install itself.
+ADD --checksum=sha256:71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e \
+    https://files.pythonhosted.org/packages/f3/6e/1736e5b4ae2b778ef2f81c47d797de9f891d4d8acb047a24ca37a60294dd/pip-26.2.1-py3-none-any.whl /tmp/pip-26.2.1-py3-none-any.whl
+RUN python3 /tmp/pip-26.2.1-py3-none-any.whl/pip install --no-index /tmp/pip-26.2.1-py3-none-any.whl \
+    && rm /tmp/pip-26.2.1-py3-none-any.whl \
     && python3 --version && python3 -m pip --version
 
 ENV SITE_PACKAGES=/usr/local/lib/python${PYTHON_VERSION}/dist-packages
@@ -50,17 +55,27 @@ ENV ROCM_PATH=${SDK_DEV} \
     PATH=${SDK_DEV}/bin:${SDK_DEV}/lib/llvm/bin:${SDK_CORE}/bin:${PATH} \
     HSA_NO_SCRATCH_RECLAIM=1
 
-RUN --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=locked \
+RUN --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=shared \
     python3 -m pip install -U packaging 'cmake<4' ninja wheel 'setuptools<80' build \
         pybind11==3.0.4 Cython setuptools_scm
 
-RUN --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=locked \
+RUN --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=shared \
     python3 -m pip install --index-url "${ROCM_INDEX_URL}" \
         "rocm[libraries,devel]==${ROCM_SDK_VERSION}" \
         "rocm[device-${GPU_ARCH}]==${ROCM_SDK_VERSION}" \
     && rocm-sdk init \
     && test -x "${SDK_DEV}/lib/llvm/bin/clang++" \
     && test -d "${HIP_DEVICE_LIB_PATH}"
+
+# amdsmi: vLLM detects ROCm through "import amdsmi", and TheRock ships it only as
+# sources inside rocm-sdk-core. scripts/rpb-build-amdsmi makes it installable on its
+# own (as vLLM's therock_wheels.py does); the wheel is kept in /opt/rpb/wheels and
+# exported with the test results.
+COPY --chmod=0755 scripts/rpb-build-amdsmi /usr/local/bin/rpb-build-amdsmi
+RUN --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=shared \
+    rpb-build-amdsmi "${SDK_CORE}/share/amd_smi" /opt/rpb/wheels \
+    && python3 -m pip install --no-deps /opt/rpb/wheels/amdsmi-*.whl \
+    && (cd / && python3 -c "import amdsmi")
 
 # TheRock runtime fixes, copied from vLLM's Dockerfile.rocm_base at the pinned commit.
 RUN if [ -f "${SITE_PACKAGES}/rocm_sdk/__init__.py" ]; then \

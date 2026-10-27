@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Pin the installed torch and triton so later pip installs cannot replace them.
+"""Pin the installed torch, triton and (once installed) torchvision so later pip
+installs cannot replace them.
 
     rpb-write-constraints /etc/rpb-constraints.txt
 """
@@ -7,9 +8,18 @@ import importlib.metadata as md
 import sys
 
 torch_v = md.version("torch")
-triton_v = md.version("triton")
 if "+rpb." not in torch_v:
     sys.exit(f"installed torch {torch_v} is not our build (+rpb.)")
+pins = {"torch": torch_v, "triton": md.version("triton")}
+try:
+    vision_v = md.version("torchvision")
+except md.PackageNotFoundError:
+    vision_v = None
+if vision_v is not None:
+    if "+rpb." not in vision_v:
+        sys.exit(f"installed torchvision {vision_v} is not our build (+rpb.)")
+    pins["torchvision"] = vision_v
+text = "".join(f"{name}=={version}\n" for name, version in pins.items())
 with open(sys.argv[1], "w") as f:
-    f.write(f"torch=={torch_v}\ntriton=={triton_v}\n")
-print(f"torch=={torch_v}\ntriton=={triton_v}")
+    f.write(text)
+print(text, end="")

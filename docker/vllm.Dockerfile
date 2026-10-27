@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1.28@sha256:bb22d9815c728170f72750f4e5b0d672e06176142e1d602c7e66c050100b7e5b
 # vLLM from source against our torch. The stage split mirrors vLLM's docker/Dockerfile.rocm
 # at the pinned commit:
-#   deps       : Python requirements (changes rarely)
-#   rust-build : the vllm-rs frontend
-#   csrc-build : native HIP/C++ extension, keyed ONLY on native inputs
+#   deps       : Python requirements from requirements/common.txt and rocm.txt only
+#   rust-build : the vllm-rs frontend, compiled through sccache (RUSTC_WRAPPER)
+#   csrc-build : native HIP/C++ extension, keyed on deps plus the native sources only
+#                (not on VLLM_VERSION or the Python sources)
 #   build      : Python packaging that reuses the native wheel (VLLM_USE_PRECOMPILED=1)
 
 # src vLLM source at VLLM_SHA, verified by ADD --checksum
@@ -30,35 +31,51 @@ ARG TRITON_SHA
 ADD --checksum=${TRITON_SHA} https://github.com/ROCm/triton.git#${TRITON_SHA}:python/triton_kernels/triton_kernels /
 
 FROM torch-dev AS deps
-ARG VLLM_VERSION
-RUN test -n "${VLLM_VERSION}" || { echo "VLLM_VERSION is empty: see docs/PINS.md" >&2; exit 1; }
+# GPU_ARCH (ENV) comes from the torch-dev image, RPB_GFX from this bake: a torch-dev
+# image built for another target (TORCH_DEV_IMAGE) must not be used.
+ARG RPB_GFX
+RUN test "${GPU_ARCH}" = "${RPB_GFX}" \
+    || { echo "torch-dev is for ${GPU_ARCH}, this build is for ${RPB_GFX}" >&2; exit 1; }
 ENV VLLM_TARGET_DEVICE=rocm
 WORKDIR /w/vllm
-COPY --from=patched /w/vllm/requirements/ requirements/
-RUN --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=locked \
+# Only the two files the ROCm install reads (rocm.txt includes common.txt), as
+# vLLM's Dockerfile.rocm does, so other requirement edits do not rebuild csrc.
+COPY --from=patched /w/vllm/requirements/common.txt /w/vllm/requirements/rocm.txt requirements/
+RUN --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=shared \
     python3 -m pip install -r requirements/rocm.txt
 
 FROM base AS rust-build
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG RUST_TOOLCHAIN
 ARG VLLM_VERSION
-ENV CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup CARGO_BUILD_JOBS=4 CARGO_NET_RETRY=10
+ARG MAX_JOBS
+ENV CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup CARGO_NET_RETRY=10
 ENV PATH=/root/.cargo/bin:${PATH}
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none \
+# rustup-init 1.29.1, verified by sha256 (static.rust-lang.org/rustup/archive/1.29.1/.../rustup-init.sha256)
+ADD --chmod=0755 --checksum=sha256:dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71 \
+    https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-unknown-linux-gnu/rustup-init /tmp/rustup-init
+RUN /tmp/rustup-init -y --no-modify-path --default-toolchain none \
+    && rm /tmp/rustup-init \
     && rustup toolchain install "${RUST_TOOLCHAIN}" \
     && rustup default "${RUST_TOOLCHAIN}" \
     && rustc --version
 WORKDIR /w/vllm
 COPY --from=patched /w/vllm/requirements/build/rust.txt requirements/build/rust.txt
-RUN --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=locked \
+RUN --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=shared \
     python3 -m pip install -r requirements/build/rust.txt
 COPY --from=patched /w/vllm/rust rust
 COPY --from=patched /w/vllm/rust-toolchain.toml rust-toolchain.toml
 COPY --from=patched /w/vllm/tools/build_rust.py tools/build_rust.py
 COPY --from=patched /w/vllm/tools/build_rust.sh tools/build_rust.sh
+# target/ is not cached, as upstream: stale cargo metadata can outlive source changes.
 RUN --mount=type=cache,id=rpb-cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=rpb-cargo-git,target=/root/.cargo/git,sharing=locked \
-    SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_VERSION}" bash tools/build_rust.sh \
+    --mount=type=cache,id=rpb-sccache-vllm-rs,target=/root/.cache/sccache,sharing=locked \
+    --mount=type=secret,id=sccache_env,required=false \
+    export SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_VERSION}" RUSTC_WRAPPER=sccache \
+           CARGO_BUILD_JOBS="${MAX_JOBS}" SCCACHE_CACHE_SIZE=5G \
+    && mkdir -p /out/telemetry \
+    && rpb-sccache-run vllm-rs -- bash tools/build_rust.sh \
     && test -x vllm/vllm-rs
 
 FROM deps AS csrc-build
@@ -83,11 +100,13 @@ RUN --mount=type=bind,from=patched,source=/w/vllm/pyproject.toml,target=/w/vllm/
 
 FROM deps AS build
 ARG VLLM_VERSION
+RUN test -n "${VLLM_VERSION}" || { echo "VLLM_VERSION is empty: see docs/PINS.md" >&2; exit 1; }
 COPY --from=patched /w/vllm /w/vllm
 COPY --from=csrc-build /w/vllm/dist /precompiled-wheels
 COPY --from=rust-build /w/vllm/vllm/vllm-rs /w/vllm/vllm/vllm-rs
 COPY --from=rust-build /w/vllm/vllm/_rust_*.so /w/vllm/vllm/
 COPY --from=csrc-build /out/telemetry/ /out/telemetry/
+COPY --from=rust-build /out/telemetry/ /out/telemetry/
 RUN native_wheel=$(ls /precompiled-wheels/*.whl) \
     && export SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_VERSION}" \
               VLLM_USE_PRECOMPILED=1 \

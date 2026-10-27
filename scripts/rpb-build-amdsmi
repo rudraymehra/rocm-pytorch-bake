@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Build an installable amdsmi wheel from the sources TheRock ships in rocm-sdk-core.
+
+    rpb-build-amdsmi <rocm-sdk-core>/share/amd_smi <wheel-dir>
+
+amdsmi finds libamd_smi.so relative to its own source location, which is right
+only while it is imported from inside rocm-sdk-core. Installed as a package of its
+own it fails with KeyError: 'libamd_smi.so'. This adds one more place to look:
+the lib directory of the installed _rocm_sdk_core package. vLLM's
+tools/vllm-rocm/therock_wheels.py (patch-amdsmi) solves it the same way.
+"""
+
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ANCHOR = "    possible_locations.append(libamd_smi_path)\n"
+ADDED = """\
+    # rocm-pytorch-bake: installed as its own package, use rocm-sdk-core's lib.
+    try:
+        import importlib.util
+        _sdk_core = importlib.util.find_spec("_rocm_sdk_core")
+        if _sdk_core is not None and _sdk_core.origin:
+            for _lib in sorted(Path(_sdk_core.origin).parent.glob("lib/libamd_smi.so*")):
+                possible_locations.append(_lib)
+    except Exception:
+        pass
+"""
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print(__doc__, file=sys.stderr)
+        return 2
+    src, out = Path(sys.argv[1]), Path(sys.argv[2])
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp) / "amd_smi"
+        shutil.copytree(src, work, ignore=shutil.ignore_patterns("tests"))
+        wrapper = work / "amdsmi" / "amdsmi_wrapper.py"
+        text = wrapper.read_text()
+        if text.count(ANCHOR) != 1:
+            print(f"rpb-build-amdsmi: loader anchor not found in {wrapper}; amdsmi changed upstream", file=sys.stderr)
+            return 1
+        wrapper.write_text(text.replace(ANCHOR, ANCHOR + ADDED))
+        subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-deps", "--wheel-dir", str(out), str(work)],
+                       check=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

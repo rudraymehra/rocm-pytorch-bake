@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Point the shared objects of an unpacked torch wheel at the ROCm libraries of
+# TheRock's pip packages, which install next to torch in site-packages
+# (_rocm_sdk_core, _rocm_sdk_libraries). Without this the wheel loads only where
+# the ROCm libraries are on the system search path, as in our build images.
+# Same paths as PyTorch's own TheRock wheel repair (rocm_rpaths), set as DT_RPATH.
+#
+#   rpb-set-rocm-rpath <unpacked-wheel-dir>     # the directory that contains torch/
+set -euo pipefail
+
+root=${1:?usage: rpb-set-rocm-rpath <unpacked-wheel-dir>}
+[ -d "$root/torch/lib" ] || { echo "rpb-set-rocm-rpath: $root/torch/lib not found" >&2; exit 2; }
+
+sdk() { # sdk <prefix>: the ROCm library directories relative to $ORIGIN<prefix>
+    local p=$1
+    printf '%s' "\$ORIGIN$p/_rocm_sdk_core/lib:\$ORIGIN$p/_rocm_sdk_core/lib/rocm_sysdeps/lib"
+    printf '%s' ":\$ORIGIN$p/_rocm_sdk_libraries/lib:\$ORIGIN$p/_rocm_sdk_core/lib/llvm/lib"
+}
+
+set_rpath() { # set_rpath <file> <rocm-part> <own-part>: ROCm paths first, then the existing entries
+    local f=$1 old new entry
+    old=$(patchelf --print-rpath "$f")
+    new="$2:$3"
+    IFS=: read -r -a entries <<< "$old"
+    for entry in ${entries[@]+"${entries[@]}"}; do
+        case ":$new:" in *":$entry:"*) ;; *) new="$new:$entry" ;; esac
+    done
+    patchelf --force-rpath --set-rpath "$new" "$f"
+}
+
+n=0
+# torch/*.so (for example _C.so) sit one level below site-packages; torch/lib/*.so two.
+for f in "$root"/torch/*.so*; do
+    [ -f "$f" ] || continue
+    set_rpath "$f" "$(sdk /..)" "\$ORIGIN:\$ORIGIN/lib"
+    n=$((n + 1))
+done
+for f in "$root"/torch/lib/*.so*; do
+    [ -f "$f" ] || continue
+    set_rpath "$f" "$(sdk /../..)" "\$ORIGIN"
+    n=$((n + 1))
+done
+[ "$n" -gt 0 ] || { echo "rpb-set-rocm-rpath: no shared objects under $root/torch" >&2; exit 1; }
+echo "rpb-set-rocm-rpath: set RPATH on $n shared objects"

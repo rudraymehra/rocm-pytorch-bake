@@ -9,11 +9,17 @@ ARG LMCACHE_SHA
 ADD --checksum=${LMCACHE_SHA} https://github.com/LMCache/LMCache.git#${LMCACHE_REF} /
 
 FROM torch-dev AS prepared
+# GPU_ARCH (ENV) comes from the torch-dev image, RPB_GFX from this bake: a torch-dev
+# image built for another target (TORCH_DEV_IMAGE) must not be used.
+ARG RPB_GFX
+RUN test "${GPU_ARCH}" = "${RPB_GFX}" \
+    || { echo "torch-dev is for ${GPU_ARCH}, this build is for ${RPB_GFX}" >&2; exit 1; }
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 COPY --from=src / /w/lmcache
 COPY patches/lmcache/ /patches/
 # Our patches, applied in file-name order (patch comes with build-essential).
-RUN cd /w/lmcache \
+RUN set -eu; \
+    cd /w/lmcache \
     && for p in /patches/*.patch; do \
         [ -e "$p" ] || continue; \
         echo "applying $p"; \
@@ -28,7 +34,7 @@ RUN cd /w/lmcache \
         -e '/^(cufile-python|nvtx)([<=>[:space:]]|$)/d' \
         -e 's/^numpy<=2\.2\.6$/numpy<=2.3.5/' \
         requirements/common.txt
-RUN --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=locked \
+RUN --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=shared \
     python3 -m pip install -r /w/lmcache/requirements/build.txt
 
 FROM prepared AS build

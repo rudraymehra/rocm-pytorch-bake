@@ -14,7 +14,7 @@ ARG MAX_JOBS
 RUN --mount=type=bind,from=src,target=/w/triton,rw \
     --mount=type=cache,id=rpb-sccache-triton-${GPU_ARCH},target=/root/.cache/sccache,sharing=locked \
     --mount=type=cache,id=rpb-triton-downloads,target=/root/.triton,sharing=locked \
-    --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=locked \
+    --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=shared \
     --mount=type=secret,id=sccache_env,required=false \
     cd /w/triton \
     && if [ ! -f setup.py ]; then cd python; fi \
