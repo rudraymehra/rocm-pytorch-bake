@@ -114,7 +114,11 @@ SDE_PYTORCH ?= $(call sde,Dockerfile.pytorch)
 SDE_TRITON  ?= $(call sde,Dockerfile.triton)
 SDE_AITER   ?= $(call sde,Dockerfile.aiter)
 SDE_RUNTIME ?= $(call sde,Dockerfile.runtime)
+SDE_NIXL    ?= $(call sde,Dockerfile.nixl)
+SDE_VLLM    ?= $(call sde,Dockerfile.vllm)
+SDE_LMCACHE ?= $(call sde,Dockerfile.lmcache)
 export SDE_BASE SDE_PYTORCH SDE_TRITON SDE_AITER SDE_RUNTIME
+export SDE_NIXL SDE_VLLM SDE_LMCACHE
 
 TELEMETRY ?= 1
 ifeq ($(TELEMETRY),0)
@@ -132,6 +136,10 @@ endif
         _build-all _push-all \
         push-torch-wheel fetch-torch-wheel \
         push-triton-wheel fetch-triton-wheel \
+        push-nixl-wheel fetch-nixl-wheel \
+        build-vllm push-vllm push-vllm-wheel fetch-vllm-wheel \
+        build-lmcache push-lmcache push-lmcache-wheel fetch-lmcache-wheel \
+        build-serving push-serving \
         cache-stats cache-summary cache-check cache-logs builder-load \
         layer-summary \
         list-vars \
@@ -607,7 +615,7 @@ push-all: ## Build and push everything (* targets) — the usual way to build
 _push-all: builder-ensure
 	$(call bake,,--push)
 
-push-wheels: builder-ensure ## Push just the three wheel artifacts
+push-wheels: builder-ensure ## Push just the wheel artifacts (torch, triton, aiter, nixl)
 	$(call bake,wheels,--push)
 
 ##@ Wheels
@@ -643,6 +651,89 @@ fetch-aiter-wheel: ## Fetch the AITER wheel from Zot into ./dist
 		| docker buildx build --builder $(BUILDER) \
 			--output type=local,dest=dist -
 	@ls -la dist/wheels/
+
+push-nixl-wheel: builder-ensure ## * Build and push the NIXL wheel image (NIXL + ROCm UCX)
+	$(call bake,nixl-wheel,--push)
+
+fetch-nixl-wheel: ## Fetch the NIXL wheel from Zot into ./dist
+	@mkdir -p dist
+	@printf 'FROM %s/%s/nixl-wheel:latest\n' "$(REGISTRY)" "$(REGISTRY_NAME)" \
+		| docker buildx build --builder $(BUILDER) \
+			--output type=local,dest=dist -
+	@ls -la dist/wheels/
+
+# ─── Serving stack ────────────────────────────────────────────────
+# vLLM and LMCache, plus the NIXL wheel they both transfer KV cache
+# through. Not part of build-all/push-all: each builds FROM the pytorch
+# image and takes longer than that whole group, so they are driven
+# explicitly rather than on every rebuild.
+#
+# Like build-all, the build-* variants are single-builder only. Their
+# inputs arrive through `target:` contexts, which the balancer cannot
+# carry across nodes — see the comment on build-all.
+##@ Serving (vLLM / LMCache)
+
+# Exported, not passed as --set "*.args.X": a bake variable reads from
+# an environment variable of the same name, whereas --set "*.args." adds
+# a build ARG to *every* target, changing the cache key of targets that
+# never use it.
+#
+# These must carry real values rather than being left empty and relying
+# on bake.hcl's defaults — an exported empty variable is still *set*, so
+# bake would override its own default with "". Keep them in step with
+# the variable block in bake.hcl, the same way PYTORCH_VERSION is.
+VLLM_REF ?= v0.32.0
+LMCACHE_REF ?= v0.5.6
+NIXL_REF ?= v1.5.1
+UCX_REF ?= v1.22.0
+export VLLM_REF
+export LMCACHE_REF
+export NIXL_REF
+export UCX_REF
+
+build-vllm: builder-ensure ## Build the vLLM serving image (single builder)
+	$(call bake,vllm)
+
+push-vllm: builder-ensure ## * Build and push the vLLM serving image
+	$(call bake,vllm,--push)
+
+push-vllm-wheel: builder-ensure ## * Build and push the vLLM wheel image
+	$(call bake,vllm-wheel,--push)
+
+fetch-vllm-wheel: ## Fetch the vLLM wheel from Zot into ./dist
+	@mkdir -p dist
+	@printf 'FROM %s/%s/vllm-wheel:latest\n' "$(REGISTRY)" "$(REGISTRY_NAME)" \
+		| docker buildx build --builder $(BUILDER) \
+			--output type=local,dest=dist -
+	@ls -la dist/wheels/
+
+build-lmcache: builder-ensure ## Build the LMCache MP image (single builder)
+	$(call bake,lmcache)
+
+push-lmcache: builder-ensure ## * Build and push the LMCache multi-process image
+	$(call bake,lmcache,--push)
+
+push-lmcache-wheel: builder-ensure ## * Build and push the LMCache wheel image
+	$(call bake,lmcache-wheel,--push)
+
+fetch-lmcache-wheel: ## Fetch the LMCache wheel from Zot into ./dist
+	@mkdir -p dist
+	@printf 'FROM %s/%s/lmcache-wheel:latest\n' "$(REGISTRY)" "$(REGISTRY_NAME)" \
+		| docker buildx build --builder $(BUILDER) \
+			--output type=local,dest=dist -
+	@ls -la dist/wheels/
+
+build-serving: builder-ensure ## Build nixl + vLLM + LMCache (single builder)
+	@if [ "$(BUILDER)" = "$(POOL_BUILDER)" ]; then \
+		echo "build-serving cannot use $(POOL_BUILDER): these targets exchange"; \
+		echo "results through 'target:' contexts, which only resolve within a"; \
+		echo "single builder. Use 'make push-serving' or name a node."; \
+		exit 1; \
+	fi
+	$(call bake,serving)
+
+push-serving: builder-ensure ## * Build and push nixl + vLLM + LMCache
+	$(call bake,serving,--push)
 
 # ─── Run ──────────────────────────────────────────────────────────
 # Executing what the Build section produced, as opposed to producing
@@ -718,6 +809,9 @@ list-vars: ## Show the variables these targets read, and their values
 	@printf '  \033[36m%-24s\033[0m %s\n' SDE_TRITON "$(SDE_TRITON)  ($(shell date -u -d @$(SDE_TRITON) '+%Y-%m-%d %H:%M' 2>/dev/null))"
 	@printf '  \033[36m%-24s\033[0m %s\n' SDE_AITER "$(SDE_AITER)  ($(shell date -u -d @$(SDE_AITER) '+%Y-%m-%d %H:%M' 2>/dev/null))"
 	@printf '  \033[36m%-24s\033[0m %s\n' SDE_RUNTIME "$(SDE_RUNTIME)  ($(shell date -u -d @$(SDE_RUNTIME) '+%Y-%m-%d %H:%M' 2>/dev/null))"
+	@printf '  \033[36m%-24s\033[0m %s\n' SDE_NIXL "$(SDE_NIXL)  ($(shell date -u -d @$(SDE_NIXL) '+%Y-%m-%d %H:%M' 2>/dev/null))"
+	@printf '  \033[36m%-24s\033[0m %s\n' SDE_VLLM "$(SDE_VLLM)  ($(shell date -u -d @$(SDE_VLLM) '+%Y-%m-%d %H:%M' 2>/dev/null))"
+	@printf '  \033[36m%-24s\033[0m %s\n' SDE_LMCACHE "$(SDE_LMCACHE)  ($(shell date -u -d @$(SDE_LMCACHE) '+%Y-%m-%d %H:%M' 2>/dev/null))"
 	@printf '\n\033[1mToggles\033[0m\n'
 	@printf '  \033[36m%-24s\033[0m %s\n' TELEMETRY "$(TELEMETRY)  (0 skips metrics collection)"
 	@printf '  \033[36m%-24s\033[0m %s\n' FORCE_RECACHE "$(if $(FORCE_RECACHE),$(FORCE_RECACHE),false)  (true = recompile everything, ignoring sccache)"

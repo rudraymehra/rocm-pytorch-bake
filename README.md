@@ -164,14 +164,27 @@ together, every tunable, and troubleshooting.
 ```
 pytorch-base (no deps)
     │
-    ▼
+    ├──────────────► triton-wheel (base + cmake<4; parallel with pytorch)
+    │                     │
+    ▼                     │
 pytorch (depends on pytorch-base)
-    │
+    │                     │
     ├─ pytorch-test (same as pytorch, runs verification)
+    ├─ pytorch-run  (depends on pytorch output)
+    ├─ pytorch-wheel
+    │                     │
+    ├─────────────────────┴──► aiter-wheel  (pytorch + triton-wheel)
     │
-    ▼
-pytorch-run (depends on pytorch output)
+    ├──► nixl-wheel (pytorch; builds UCX from source)
+    │         │
+    │         ├──► vllm    (pytorch + triton + aiter + nixl)
+    │         └──► lmcache (pytorch + triton + nixl)
 ```
+
+Everything below `pytorch` is reached through bake `target:` contexts,
+so a single invocation can build the whole chain without anything having
+been pushed first. That also means these targets cannot be scheduled
+across nodes — see the note on `build-all` in the Makefile.
 
 ### Cache Strategy
 
@@ -391,7 +404,90 @@ docker buildx bake -f bake.hcl \
 | `pytorch` | Full PyTorch build with deps | `rocm-pytorch/pytorch:2.14.1-10.1.0-full-gfx950` |
 | `pytorch-run` | Minimal runtime image | `rocm-pytorch/runtime:2.14.1-10.1.0-full` |
 | `pytorch-test` | Build + verify test | `rocm-pytorch/pytorch:…-gfx950-test` |
-| `default` / `all` | Every target | - |
+| `pytorch-wheel` | torch wheel artifact | `rocm-pytorch/pytorch-wheel:2.14.1-10.1.0-full-gfx950` |
+| `triton-wheel` | Triton 3.8.0 built for ROCm 10.1 | `rocm-pytorch/triton-wheel:10.1.0-full-gfx950` |
+| `aiter-wheel` | AITER wheel | `rocm-pytorch/aiter-wheel:2.14.1-10.1.0-full-gfx950` |
+| `nixl-wheel` | NIXL + ROCm UCX wheel | `rocm-pytorch/nixl-wheel:v1.5.1-10.1.0-full-gfx950` |
+| `vllm` | vLLM serving image | `rocm-pytorch/vllm:v0.32.0-10.1.0-full-gfx950` |
+| `vllm-wheel` | vLLM wheel artifact | `rocm-pytorch/vllm-wheel:v0.32.0-10.1.0-full-gfx950` |
+| `lmcache` | LMCache multi-process runtime | `rocm-pytorch/lmcache:v0.5.6-10.1.0-full-gfx950` |
+| `lmcache-wheel` | LMCache wheel artifact | `rocm-pytorch/lmcache-wheel:v0.5.6-10.1.0-full-gfx950` |
+| `wheels` | All wheel artifacts | - |
+| `serving` | `nixl-wheel` + vLLM + LMCache | - |
+| `default` / `all` | Base, pytorch, runtime and the wheels | - |
+
+## Serving Stack (vLLM / LMCache / NIXL)
+
+vLLM and LMCache are built from source against this repo's torch rather
+than installed from a published wheel. Their native extensions link
+against torch's C++ ABI, so a wheel built for AMD's ROCm 7.x torch and
+ours cannot share a process — the same constraint that forces AITER to
+be built here.
+
+NIXL is built once (`Dockerfile.nixl`) and consumed by both. The wheel is
+self-contained: UCX is compiled from source with `--with-rocm` (Ubuntu's
+libucx has no ROCm memory-type support, so without it every device-memory
+transfer bounces through host staging) and auditwheel bundles it, so
+installing the wheel is all a consumer needs.
+
+```bash
+make push-serving              # nixl + vllm + lmcache, built and pushed
+make build-vllm                # just vLLM, single builder, no push
+make fetch-nixl-wheel          # pull a wheel artifact into ./dist
+```
+
+Refs are overridable per invocation and default to the latest release of
+each: `make push-serving VLLM_REF=v0.31.0 NIXL_REF=v1.5.0`.
+
+Running them:
+
+```bash
+# vLLM. AITER is installed but off by default; VLLM_ROCM_USE_AITER=1 turns
+# on its attention and MoE kernels.
+docker run --rm --device /dev/kfd --device /dev/dri -p 8000:8000 \
+    -e VLLM_ROCM_USE_AITER=1 \
+    snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/vllm:latest \
+    serve Qwen/Qwen3-8B
+
+# LMCache in its multi-process deployment: a controller holding the
+# cluster-wide index, and one or more cache servers holding the blocks.
+# The image has no default role — name the CLI you want.
+#
+# Note the asymmetry: lmcache_controller takes flags, lmcache_server
+# takes three positional arguments (host, port, storage). Giving the
+# server flags makes it print a usage line and exit 1.
+docker run --rm -p 9000:9000 \
+    snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/lmcache:latest \
+    lmcache_controller --host 0.0.0.0 --port 9000
+docker run --rm --device /dev/kfd --device /dev/dri -p 8100:8100 \
+    snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/lmcache:latest \
+    lmcache_server 0.0.0.0 8100 cpu
+```
+
+Three upstream constraints are worth knowing about:
+
+- **LMCache declares `requires-python >=3.10,<3.14`.** This lane is
+  cp314, because Ubuntu 26.04 — the only base AMD publishes ROCm 10.1
+  for — ships no other Python. The wheel is installed with
+  `--ignore-requires-python`; the extension is compiled here against this
+  interpreter, so the ABI matches by construction. Revisit when upstream
+  raises the bound.
+- **Both projects' requirement files carry CUDA-only or x86-wheel-only
+  pins** (`cufile-python`, `nvtx`, `tilelang`, `amd-quark`,
+  `mooncake-transfer-engine-rocm`, …). These are stripped before the
+  build, which also keeps them out of the wheel's `install_requires`.
+  The lists are build args — `VLLM_DROP_REQS` and `LMCACHE_DROP_REQS` —
+  so a dependency can be let back in once it has a usable wheel.
+- **`torchvision` is a CUDA wheel in these images, and that is not fixed
+  here.** `/etc/pip-constraints.txt` pins torch and triton to the ROCm
+  builds, but there is no ROCm torchvision in this pipeline — it is
+  resolved from PyPI by `Dockerfile.pytorch`'s optional-extras step, and
+  vLLM's `requirements/rocm.txt` keeps it reachable through `timm`. Its
+  `_C_stable.so` links `libtorch_cuda` / `libc10_cuda`, so `import
+  torchvision` fails at load time. Nothing in the text-model serving path
+  touches it, which is why the build and the import checks stay green —
+  but vision and video models will fail at serve time until a ROCm
+  torchvision is built the way torch and triton are.
 
 ## Architecture Optimization
 

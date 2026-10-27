@@ -1,0 +1,302 @@
+# syntax=docker/dockerfile:1
+# NIXL (github.com/ai-dynamo/nixl) and its UCX transport, built as a
+# standalone wheel for ROCm.
+#
+# NIXL is the KV-cache transfer layer both vLLM and LMCache use for
+# disaggregated prefill/decode, so it is built once here and consumed by
+# both — same pattern as Dockerfile.triton, for the same reason: one
+# build, two consumers, no divergence in the ABI they link against.
+#
+# Why build it rather than install it: PyPI publishes `nixl`, `nixl-cu12`
+# and `nixl-cu13`. There is no ROCm variant, and the CUDA ones carry a
+# CUDA-linked libnixl. ROCm support exists upstream but only through the
+# meson option `-Drocm_path` / `-Dwheel_variant=rocm`, which is a source
+# build. The recipe below follows vLLM's own docker/Dockerfile.rocm NIXL
+# stage, which is the reference for ROCm NIXL today.
+#
+# UCX is built here too, not apt-installed: Ubuntu's libucx has no ROCm
+# memory-type support, so without `--with-rocm` NIXL registers device
+# memory as host memory and every transfer bounces through staging.
+#
+# The wheel is self-contained. auditwheel bundles libucp/libucs/libuct
+# into it and contrib/wheel_add_ucx_plugins.py adds the UCX and NIXL
+# plugin .so files, so a consumer needs nothing from this image but
+# /wheels — which is why this builds FROM our PyTorch image but ships as
+# scratch, like Dockerfile.aiter.
+
+ARG PYTORCH_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/pytorch:latest
+
+FROM ${PYTORCH_IMAGE} AS builder
+
+# Latest releases at time of writing: NIXL v1.5.1 (2026-10-26), UCX
+# v1.22.0 (2026-08-03). Both are tags, not branches — a moving ref would
+# be served stale from the layer cache indefinitely.
+ARG NIXL_REF=v1.5.1
+ARG UCX_REF=v1.22.0
+ARG PYTORCH_ROCM_ARCH=gfx950
+ARG ROCM_VERSION=10.1.0-full
+ARG SCCACHE_WEBDAV_ENDPOINT=http://snoc-strix.fold-leaffish.ts.net:8081
+# Key namespace within the shared store, and a unix socket rather than a
+# TCP port — the builders run with --driver-opt network=host, so a fixed
+# SCCACHE_SERVER_PORT is shared by every container on the node and two
+# builds' sccache servers cross. See the long note in Dockerfile.aiter.
+ARG SCCACHE_WEBDAV_KEY_PREFIX=rocm-pytorch
+# Empty means "derive from the node"; set it to pin a job count.
+ARG MAX_JOBS=
+
+LABEL org.opencontainers.image.source="https://github.com/ai-dynamo/nixl"
+LABEL org.opencontainers.image.description="NIXL ${NIXL_REF} with ROCm UCX, for ${PYTORCH_ROCM_ARCH}"
+
+ENV ROCM_PATH=/opt/rocm \
+    UCX_HOME=/usr/local/ucx \
+    NIXL_HOME=/usr/local/nixl \
+    PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
+    SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT} \
+    SCCACHE_SERVER_UDS=/tmp/sccache.sock \
+    SCCACHE_WEBDAV_KEY_PREFIX=${SCCACHE_WEBDAV_KEY_PREFIX} \
+    SCCACHE_IGNORE_CLIENT_VERSION=1 \
+    SCCACHE_CONF=/etc/sccache.toml
+
+# sccache lives in Dockerfile.pytorch's *builder* stage and never reaches
+# `final`, which is what this image is FROM.
+ARG SCCACHE_VERSION=0.19.0
+RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    -o /tmp/sccache.tar.gz && \
+    tar xzf /tmp/sccache.tar.gz -C /usr/local/bin --strip-components=1 \
+        "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" && \
+    rm /tmp/sccache.tar.gz && chmod +x /usr/local/bin/sccache && sccache --version
+
+# Each RUN is a fresh container, so a build step has to start its own
+# sccache server, and startup probes the remote store. That probe is
+# bounded by a 10s timeout compiled into sccache — no environment
+# variable exists for it, only this config file field.
+RUN printf 'server_startup_timeout_ms = 60000\n' > /etc/sccache.toml
+
+# UCX wants autotools; NIXL wants meson/ninja and pkg-config. The verbs
+# stack is what gives UCX its RDMA transports (rc/ud over IB and RoCE) —
+# without the -dev packages configure silently drops them and NIXL falls
+# back to TCP, which is not what anyone builds NIXL for.
+#
+# The grpc/protobuf/cpprest set is for NIXL's optional etcd plugin, and
+# libaio/liburing for its POSIX file plugin. meson disables any plugin
+# whose dependency is missing, so these are the difference between a
+# full-featured libnixl and a quietly reduced one.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    libnuma-dev \
+    libibverbs-dev \
+    librdmacm-dev \
+    ibverbs-providers \
+    ibverbs-utils \
+    rdmacm-utils \
+    libaio-dev \
+    liburing-dev \
+    libgrpc++-dev \
+    libprotobuf-dev \
+    protobuf-compiler-grpc \
+    libcpprest-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# meson-python is the build backend; auditwheel and patchelf do the
+# bundling afterwards. tomlkit is what contrib/tomlutil.py uses to
+# rewrite the wheel name.
+#
+# pytest is in this list because NIXL puts it in [build-system].requires,
+# and `python -m build --no-isolation` verifies that list in full before
+# calling the backend — a missing test runner is a failed build, not a
+# skipped test.
+#
+# uv is not optional despite meson marking it `required: false`. The
+# `nixl` meta-package — the only thing that provides the importable
+# top-level `nixl` module — is produced by a custom_target that shells
+# out to `uv build`. Without uv that target is silently skipped, and the
+# result is a wheel that installs cleanly as `nixl_rocm` and then fails
+# at `import nixl` in every consumer. See the meta-wheel step below.
+RUN pip install --no-cache-dir \
+    "meson>=1.4" meson-python ninja pybind11 patchelf auditwheel \
+    build tomlkit pyyaml types-PyYAML pytest uv "setuptools>=80.9.0" && \
+    uv --version
+
+# Pin torch to exactly what this image carries. NIXL's own runtime
+# dependency on torch is unpinned, but its build dependency is not, and
+# every torch on PyPI for this Python is a CUDA build — so any pip
+# resolution that reconsiders torch would replace the ROCm one this
+# image is built around. Fail loudly instead.
+RUN python -c "import importlib.metadata as m; print(f'torch=={m.version(\"torch\")}')" \
+    > /etc/pip-constraints.txt && cat /etc/pip-constraints.txt
+ENV PIP_CONSTRAINT=/etc/pip-constraints.txt
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# --with-rocm is the whole point: it compiles UCX's ROCm memory-type
+# module, so UCX can recognise and DMA from HIP device pointers. Without
+# it NIXL sees every buffer as host memory.
+#
+# --without-gdrcopy / no CUDA: this is the ROCm lane, and configure will
+# happily half-enable a CUDA path if it finds stray headers.
+# njobs, not MAX_JOBS: MAX_JOBS is a build ARG, so BuildKit substitutes
+# every ${MAX_JOBS} in this instruction with the ARG's value *before*
+# the shell runs. Assigning to it in the shell therefore has no effect
+# on the later expansions — with an empty ARG the command reaching the
+# container is literally `-j""`. Compute into a name BuildKit does not
+# know about and read the ARG exactly once.
+RUN njobs="${MAX_JOBS}"; \
+    if [ -z "${njobs}" ]; then \
+        cores=$(nproc); \
+        njobs=$(awk '/^MemAvailable:/ {print int($2/1024/1024/2)}' /proc/meminfo); \
+        [ -n "${njobs}" ] || njobs=${cores}; \
+        [ "${njobs}" -ge 1 ] || njobs=1; \
+        [ "${njobs}" -le "${cores}" ] || njobs=${cores}; \
+    fi; \
+    echo "building UCX with -j${njobs}"; \
+    git clone --depth 1 --branch "${UCX_REF}" https://github.com/openucx/ucx.git /opt/ucx && \
+    cd /opt/ucx && \
+    ./autogen.sh && \
+    mkdir build && cd build && \
+    CC="sccache gcc" CXX="sccache g++" \
+    ../configure \
+        --prefix=${UCX_HOME} \
+        --enable-shared \
+        --disable-static \
+        --disable-doxygen-doc \
+        --enable-optimizations \
+        --enable-devel-headers \
+        --enable-mt \
+        --enable-cma \
+        --with-rocm=${ROCM_PATH} \
+        --with-verbs \
+        --with-dm \
+        --without-gdrcopy \
+        --without-cuda 2>&1 | tee /ucx-configure.log && \
+    make -j"${njobs}" 2>&1 | tee -a /ucx-build.log && \
+    make install
+
+# Record what configure actually enabled. "built with ROCm" is an easy
+# thing to believe and a hard thing to notice the absence of.
+#
+# Matched loosely on "rocm" rather than one exact filename: UCX splits
+# the ROCm support across libuct_rocm*.so and has renamed the pieces
+# between releases, so pinning a name here would fail a good build.
+RUN grep -iE 'rocm|verbs|rdmacm' /ucx-configure.log || true; \
+    ls ${UCX_HOME}/lib/ucx/ && \
+    ls ${UCX_HOME}/lib/ucx/ | grep -q rocm
+
+ENV PATH=${UCX_HOME}/bin:${PATH} \
+    LD_LIBRARY_PATH=${UCX_HOME}/lib:${LD_LIBRARY_PATH} \
+    PKG_CONFIG_PATH=${UCX_HOME}/lib/pkgconfig
+
+RUN git clone --depth 1 --branch "${NIXL_REF}" \
+    https://github.com/ai-dynamo/nixl.git /opt/nixl
+
+WORKDIR /opt/nixl
+
+# NIXL pins torch==2.11.* in [build-system].requires. `python -m build
+# --no-isolation` verifies that list against the environment before it
+# calls the backend, so the pin fails against our 2.14.1 even though
+# nothing in the meson build cares which torch minor it is — the
+# dependency exists so the torch-tensor binding has headers to compile
+# against. Relax it to a bare `torch` rather than installing a second,
+# non-ROCm torch over the one this image exists to carry.
+RUN sed -i 's/"torch==2\.11\.\*"/"torch"/' pyproject.toml && \
+    grep -n 'torch' pyproject.toml
+
+# Build the shared library and plugins into NIXL_HOME first. The wheel
+# build below produces its own copy, but the installed tree is what
+# wheel_add_ucx_plugins.py reads the NIXL plugins from.
+#
+# -Dwerror=false overrides the project's own `werror=true` default.
+# NIXL's src/core/sync.h calls absl::Mutex::ReaderUnlock, which Ubuntu
+# 26.04's abseil marks deprecated — so on this base, and only on this
+# base, a warning NIXL cannot see coming ends the build at [87/108].
+# Dropped rather than silenced per-warning: the next newer system
+# library will deprecate something else.
+RUN njobs="${MAX_JOBS}"; \
+    [ -n "${njobs}" ] || njobs=$(nproc); \
+    CC="sccache gcc" CXX="sccache g++" \
+    meson setup build \
+        --prefix=${NIXL_HOME} \
+        -Ducx_path=${UCX_HOME} \
+        -Drocm_path=${ROCM_PATH} \
+        -Dwheel_variant=rocm \
+        -Dbuild_tests=false \
+        -Dbuild_examples=false \
+        -Dwerror=false 2>&1 | tee /nixl-setup.log && \
+    cd build && \
+    ninja -j"${njobs}" 2>&1 | tee /nixl-build.log && \
+    ninja install && \
+    echo "${NIXL_HOME}/lib/$(uname -m)-linux-gnu" > /etc/ld.so.conf.d/nixl.conf && \
+    echo "${NIXL_HOME}/lib/$(uname -m)-linux-gnu/plugins" >> /etc/ld.so.conf.d/nixl.conf && \
+    ldconfig
+
+# tomlutil.py renames the distribution to nixl-rocm. Upstream's wheel
+# helper autodetects a CUDA major to pick the variant suffix and finds
+# none here, so the variant is set explicitly on both sides: the name
+# via tomlutil, the build via -Dwheel_variant.
+#
+# auditwheel runs with no --plat, so it picks the lowest manylinux policy
+# the wheel's own symbols allow rather than a guess that may be below the
+# base image's glibc. libamdhip64 is excluded because it belongs to the
+# ROCm installation in the consuming image, not to NIXL; libcore and
+# libpull are transitive and vary across base images.
+RUN ./contrib/tomlutil.py --wheel-name nixl-rocm pyproject.toml && \
+    CC="sccache gcc" CXX="sccache g++" \
+    python -m build --wheel --no-isolation --outdir /tmp/nixl_wheels \
+        -C setup-args=-Ducx_path=${UCX_HOME} \
+        -C setup-args=-Drocm_path=${ROCM_PATH} \
+        -C setup-args=-Dwheel_variant=rocm \
+        -C setup-args=-Dbuild_tests=false \
+        -C setup-args=-Dbuild_examples=false \
+        -C setup-args=-Dwerror=false \
+        2>&1 | tee -a /nixl-build.log && \
+    mkdir -p /wheels && \
+    auditwheel repair \
+        --exclude 'libamdhip64*' \
+        --exclude 'libcore*' \
+        --exclude 'libpull*' \
+        --wheel-dir /tmp/nixl_wheels/repaired \
+        /tmp/nixl_wheels/nixl_rocm*.whl && \
+    ./contrib/wheel_add_ucx_plugins.py \
+        --ucx-plugins-dir ${UCX_HOME}/lib/ucx \
+        --nixl-plugins-dir ${NIXL_HOME}/lib/$(uname -m)-linux-gnu/plugins \
+        /tmp/nixl_wheels/repaired/*.whl && \
+    cp /tmp/nixl_wheels/repaired/*.whl /wheels/ && \
+    sccache --show-stats | tee /wheels-sccache-stats.txt
+
+# The meta-package, built by ninja above into the build tree. It is a
+# tiny pure-python wheel whose only job is to provide the `nixl` module
+# and depend on exactly one backend — here nixl-rocm, because
+# -Dwheel_variant=rocm rewrote the dependency. Both wheels have to ship:
+# the backend alone has no `nixl` module, the meta alone has no library.
+RUN set -eu; \
+    meta=$(find /opt/nixl/build -name 'nixl-*-py3-none-any.whl' | head -1); \
+    test -n "${meta}" || { \
+        echo "meta wheel missing: did the uv custom_target run?" >&2; exit 1; }; \
+    cp "${meta}" /wheels/; \
+    ls -la /wheels/
+
+# Prove the wheel is usable before publishing it. The import is the real
+# test: it dlopens libnixl, which pulls in the bundled UCX, and that is
+# exactly the link that silently breaks when auditwheel excludes one
+# library too many. No GPU is needed to load the plugins.
+RUN pip install --no-cache-dir /wheels/*.whl && \
+    python -c "from nixl._api import nixl_agent; print('nixl import ok')"
+
+RUN cat /nixl-build.log > /wheels-build.log && ls -la /wheels/
+
+SHELL ["/bin/sh", "-c"]
+
+# ─── Wheel-only image ────────────────────────────────────────────
+# scratch, not the PyTorch image: this exists to be consumed by
+# `COPY --from=`, so it carries the wheel and nothing else.
+FROM scratch AS wheel
+
+ARG PYTORCH_ROCM_ARCH
+ARG NIXL_REF
+LABEL org.opencontainers.image.source="https://github.com/ai-dynamo/nixl"
+LABEL org.opencontainers.image.description="NIXL ${NIXL_REF} wheel (ROCm UCX) for ${PYTORCH_ROCM_ARCH}"
+
+COPY --from=builder /wheels/ /wheels/
+COPY --from=builder /wheels-build.log /wheels-sccache-stats.txt /

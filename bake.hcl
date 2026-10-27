@@ -87,6 +87,9 @@ variable "SDE_PYTORCH" { default = "" }
 variable "SDE_TRITON"  { default = "" }
 variable "SDE_AITER"   { default = "" }
 variable "SDE_RUNTIME" { default = "" }
+variable "SDE_NIXL"    { default = "" }
+variable "SDE_VLLM"    { default = "" }
+variable "SDE_LMCACHE" { default = "" }
 
 # Empty means each build derives its own job count from the node it
 # lands on, sized by memory rather than cores. Set it to pin one.
@@ -102,6 +105,34 @@ variable "PREBUILD_KERNELS" {
 
 variable "AITER_REF" {
   default = "v0.1.27"
+}
+
+# ─── Serving stack refs ──────────────────────────────────────────
+# All four are release tags, never branches: a moving ref would be
+# served from the layer cache indefinitely once built, so an "update"
+# would silently be a no-op. Bump them here.
+variable "NIXL_REF" {
+  default = "v1.5.1"
+}
+
+# UCX is built from source inside Dockerfile.nixl because Ubuntu's libucx
+# is compiled without ROCm memory-type support; see the comment there.
+variable "UCX_REF" {
+  default = "v1.22.0"
+}
+
+variable "VLLM_REF" {
+  default = "v0.32.0"
+}
+
+variable "LMCACHE_REF" {
+  default = "v0.5.6"
+}
+
+# vLLM v0.32 builds vllm/vllm-rs during setup.py; this tracks the
+# channel in its rust-toolchain.toml.
+variable "RUST_VERSION" {
+  default = "1.95"
 }
 
 variable "VCS_REF" {
@@ -217,7 +248,18 @@ group "default" {
 # The wheel artifacts. Separate because each builds FROM an image that
 # must already be published, so they cannot run from a cold registry.
 group "wheels" {
-  targets = ["pytorch-wheel", "triton-wheel", "aiter-wheel"]
+  targets = ["pytorch-wheel", "triton-wheel", "aiter-wheel", "nixl-wheel"]
+}
+
+# The serving stack: vLLM and LMCache, plus the NIXL wheel both of them
+# transfer KV cache through.
+#
+# Deliberately not in `default`. These build FROM the pytorch image and
+# each takes considerably longer than everything in that group put
+# together, so folding them in would turn every `make push-all` into an
+# hours-long run whether or not anything about them had changed.
+group "serving" {
+  targets = ["nixl-wheel", "vllm", "vllm-wheel", "lmcache", "lmcache-wheel"]
 }
 
 # Shared cache config for all targets
@@ -472,6 +514,187 @@ target "pytorch-test" {
 
   # run-target is not a bake attribute; target selects the stage.
   target = "test"
+}
+
+# ─── NIXL wheel ──────────────────────────────────────────────────
+# Builds FROM the pytorch image (NIXL's python bindings compile against
+# torch), and ships as a scratch wheel image consumed by both vllm and
+# lmcache. UCX is built inside it — see Dockerfile.nixl for why apt's
+# libucx is not usable here.
+target "nixl-wheel" {
+  dockerfile = "Dockerfile.nixl"
+  platforms  = ["linux/amd64"]
+  target     = "wheel"
+
+  tags = compact([
+    "${REGISTRY}/${REGISTRY_NAME}/nixl-wheel:${NIXL_REF}-${ROCM_VERSION}-${ARCH_TAG}",
+    "${REGISTRY}/${REGISTRY_NAME}/nixl-wheel:latest",
+    VCS_REF != "" ? "${REGISTRY}/${REGISTRY_NAME}/nixl-wheel:${NIXL_REF}-${ROCM_VERSION}-${ARCH_TAG}-g${VCS_REF}" : "",
+  ])
+
+  labels = merge(OCI_LABELS, {
+    "org.opencontainers.image.title"       = "nixl wheel"
+    "org.opencontainers.image.description" = "NIXL ${NIXL_REF} with ROCm UCX ${UCX_REF}, for ${PYTORCH_ROCM_ARCH}"
+    "org.opencontainers.image.version"     = "${NIXL_REF}-${ROCM_VERSION}-${ARCH_TAG}"
+  })
+
+  cache-from = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/nixl-wheel-cache:latest,mode=max,registry.insecure=true"]
+  cache-to   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/nixl-wheel-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"]
+
+  contexts = {
+    pytorch-img = "target:pytorch"
+  }
+
+  args = {
+    SOURCE_DATE_EPOCH       = SDE_NIXL != "" ? SDE_NIXL : null
+    PYTORCH_IMAGE           = "pytorch-img"
+    NIXL_REF                = NIXL_REF
+    UCX_REF                 = UCX_REF
+    PYTORCH_ROCM_ARCH       = PYTORCH_ROCM_ARCH
+    ROCM_VERSION            = ROCM_VERSION
+    SCCACHE_VERSION         = SCCACHE_VERSION
+    SCCACHE_WEBDAV_ENDPOINT = SCCACHE_WEBDAV_ENDPOINT
+    SCCACHE_WEBDAV_KEY_PREFIX = SCCACHE_WEBDAV_KEY_PREFIX
+  }
+
+  output = ["type=image,compression=zstd"]
+}
+
+# ─── vLLM ────────────────────────────────────────────────────────
+# The serving image. Named contexts resolve to targets rather than
+# registry refs, so a single bake invocation can build pytorch, triton,
+# aiter and nixl and hand each result straight in — same reasoning as
+# aiter-wheel.
+target "vllm" {
+  dockerfile = "Dockerfile.vllm"
+  platforms  = ["linux/amd64"]
+  target     = "final"
+
+  tags = compact([
+    "${REGISTRY}/${REGISTRY_NAME}/vllm:${VLLM_REF}-${ROCM_VERSION}-${ARCH_TAG}",
+    "${REGISTRY}/${REGISTRY_NAME}/vllm:latest",
+    VCS_REF != "" ? "${REGISTRY}/${REGISTRY_NAME}/vllm:${VLLM_REF}-${ROCM_VERSION}-${ARCH_TAG}-g${VCS_REF}" : "",
+  ])
+
+  labels = merge(OCI_LABELS, {
+    "org.opencontainers.image.title"       = "vllm"
+    "org.opencontainers.image.description" = "vLLM ${VLLM_REF} on PyTorch ${PYTORCH_VERSION}, ROCm ${ROCM_VERSION}, ${PYTORCH_ROCM_ARCH}"
+    "org.opencontainers.image.version"     = "${VLLM_REF}-${ROCM_VERSION}-${ARCH_TAG}"
+  })
+
+  cache-from = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/vllm-cache:latest,mode=max,registry.insecure=true"]
+  cache-to   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/vllm-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"]
+
+  contexts = {
+    pytorch-img   = "target:pytorch"
+    triton-wheels = "target:triton-wheel"
+    aiter-wheels  = "target:aiter-wheel"
+    nixl-wheels   = "target:nixl-wheel"
+  }
+
+  args = {
+    SOURCE_DATE_EPOCH       = SDE_VLLM != "" ? SDE_VLLM : null
+    PYTORCH_IMAGE           = "pytorch-img"
+    TRITON_WHEEL_IMAGE      = "triton-wheels"
+    AITER_WHEEL_IMAGE       = "aiter-wheels"
+    NIXL_WHEEL_IMAGE        = "nixl-wheels"
+    VLLM_REF                = VLLM_REF
+    # Same ref the aiter-wheel target built from: Dockerfile.vllm fetches
+    # AITER's requirements.txt at this tag because the wheel does not
+    # carry its own runtime dependencies.
+    AITER_REF               = AITER_REF
+    RUST_VERSION            = RUST_VERSION
+    PYTORCH_ROCM_ARCH       = PYTORCH_ROCM_ARCH
+    ROCM_VERSION            = ROCM_VERSION
+    SCCACHE_VERSION         = SCCACHE_VERSION
+    SCCACHE_WEBDAV_ENDPOINT = SCCACHE_WEBDAV_ENDPOINT
+    SCCACHE_WEBDAV_KEY_PREFIX = SCCACHE_WEBDAV_KEY_PREFIX
+  }
+
+  output = ["type=image,compression=zstd"]
+}
+
+# ─── vLLM wheel artifact ─────────────────────────────────────────
+target "vllm-wheel" {
+  inherits   = ["vllm"]
+  target     = "wheel"
+  dockerfile = "Dockerfile.vllm"
+
+  tags = compact([
+    "${REGISTRY}/${REGISTRY_NAME}/vllm-wheel:${VLLM_REF}-${ROCM_VERSION}-${ARCH_TAG}",
+    "${REGISTRY}/${REGISTRY_NAME}/vllm-wheel:latest",
+    VCS_REF != "" ? "${REGISTRY}/${REGISTRY_NAME}/vllm-wheel:${VLLM_REF}-${ROCM_VERSION}-${ARCH_TAG}-g${VCS_REF}" : "",
+  ])
+
+  labels = merge(OCI_LABELS, {
+    "org.opencontainers.image.title"       = "vllm wheel"
+    "org.opencontainers.image.description" = "vLLM ${VLLM_REF} wheel for ${PYTORCH_ROCM_ARCH}, ROCm ${ROCM_VERSION}"
+    "org.opencontainers.image.version"     = "${VLLM_REF}-${ROCM_VERSION}-${ARCH_TAG}"
+  })
+}
+
+# ─── LMCache (multi-process) ─────────────────────────────────────
+# No aiter context: LMCache's extension is cache movement, not GEMMs,
+# and it has no AITER code path.
+target "lmcache" {
+  dockerfile = "Dockerfile.lmcache"
+  platforms  = ["linux/amd64"]
+  target     = "final"
+
+  tags = compact([
+    "${REGISTRY}/${REGISTRY_NAME}/lmcache:${LMCACHE_REF}-${ROCM_VERSION}-${ARCH_TAG}",
+    "${REGISTRY}/${REGISTRY_NAME}/lmcache:latest",
+    VCS_REF != "" ? "${REGISTRY}/${REGISTRY_NAME}/lmcache:${LMCACHE_REF}-${ROCM_VERSION}-${ARCH_TAG}-g${VCS_REF}" : "",
+  ])
+
+  labels = merge(OCI_LABELS, {
+    "org.opencontainers.image.title"       = "lmcache"
+    "org.opencontainers.image.description" = "LMCache ${LMCACHE_REF} multi-process runtime on PyTorch ${PYTORCH_VERSION}, ROCm ${ROCM_VERSION}, ${PYTORCH_ROCM_ARCH}"
+    "org.opencontainers.image.version"     = "${LMCACHE_REF}-${ROCM_VERSION}-${ARCH_TAG}"
+  })
+
+  cache-from = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/lmcache-cache:latest,mode=max,registry.insecure=true"]
+  cache-to   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/lmcache-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"]
+
+  contexts = {
+    pytorch-img   = "target:pytorch"
+    triton-wheels = "target:triton-wheel"
+    nixl-wheels   = "target:nixl-wheel"
+  }
+
+  args = {
+    SOURCE_DATE_EPOCH       = SDE_LMCACHE != "" ? SDE_LMCACHE : null
+    PYTORCH_IMAGE           = "pytorch-img"
+    TRITON_WHEEL_IMAGE      = "triton-wheels"
+    NIXL_WHEEL_IMAGE        = "nixl-wheels"
+    LMCACHE_REF             = LMCACHE_REF
+    PYTORCH_ROCM_ARCH       = PYTORCH_ROCM_ARCH
+    ROCM_VERSION            = ROCM_VERSION
+    SCCACHE_VERSION         = SCCACHE_VERSION
+    SCCACHE_WEBDAV_ENDPOINT = SCCACHE_WEBDAV_ENDPOINT
+    SCCACHE_WEBDAV_KEY_PREFIX = SCCACHE_WEBDAV_KEY_PREFIX
+  }
+
+  output = ["type=image,compression=zstd"]
+}
+
+# ─── LMCache wheel artifact ──────────────────────────────────────
+target "lmcache-wheel" {
+  inherits   = ["lmcache"]
+  target     = "wheel"
+  dockerfile = "Dockerfile.lmcache"
+
+  tags = compact([
+    "${REGISTRY}/${REGISTRY_NAME}/lmcache-wheel:${LMCACHE_REF}-${ROCM_VERSION}-${ARCH_TAG}",
+    "${REGISTRY}/${REGISTRY_NAME}/lmcache-wheel:latest",
+    VCS_REF != "" ? "${REGISTRY}/${REGISTRY_NAME}/lmcache-wheel:${LMCACHE_REF}-${ROCM_VERSION}-${ARCH_TAG}-g${VCS_REF}" : "",
+  ])
+
+  labels = merge(OCI_LABELS, {
+    "org.opencontainers.image.title"       = "lmcache wheel"
+    "org.opencontainers.image.description" = "LMCache ${LMCACHE_REF} wheel for ${PYTORCH_ROCM_ARCH}, ROCm ${ROCM_VERSION}"
+    "org.opencontainers.image.version"     = "${LMCACHE_REF}-${ROCM_VERSION}-${ARCH_TAG}"
+  })
 }
 
 # ─── Builders ────────────────────────────────────────────────────

@@ -1,0 +1,258 @@
+# syntax=docker/dockerfile:1
+# LMCache (github.com/LMCache/LMCache) in its multi-process deployment,
+# built against this repo's ROCm 10.1 PyTorch, with NIXL for transfer.
+#
+# "Multi-process" is LMCache's own term for splitting the KV cache out
+# of the inference process: a controller (`lmcache_controller`) holding
+# the cluster-wide index, one or more cache servers (`lmcache_server`)
+# holding the KV blocks, and the serving engine talking to them over the
+# gRPC transport under lmcache/v1/multiprocess/. All three CLIs ship in
+# this image; which one a container runs is chosen at `docker run` time.
+#
+# Why build it: LMCache's `cuda_ops` extension is a torch C++ extension.
+# It hipifies its CUDA sources and compiles them with hipcc against the
+# torch that is present at build time, so it is bound to our torch
+# 2.14.1 / ROCm 10.1 build exactly as AITER is. The ROCm wheels LMCache
+# publishes are built against ROCm 7.2.4 and torch 2.10.
+#
+# Like Dockerfile.vllm, one builder produces both a runnable image and a
+# scratch wheel artifact.
+
+ARG PYTORCH_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/pytorch:latest
+ARG TRITON_WHEEL_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/triton-wheel:latest
+ARG NIXL_WHEEL_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/nixl-wheel:latest
+
+FROM ${TRITON_WHEEL_IMAGE} AS tritonwheels
+FROM ${NIXL_WHEEL_IMAGE} AS nixlwheels
+
+# ─── Shared environment ──────────────────────────────────────────
+FROM ${PYTORCH_IMAGE} AS deps
+
+ARG PYTORCH_ROCM_ARCH=gfx950
+ARG ROCM_VERSION=10.1.0-full
+
+ENV ROCM_PATH=/opt/rocm \
+    PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
+
+COPY --from=tritonwheels /wheels/ /opt/wheels/triton/
+COPY --from=nixlwheels   /wheels/ /opt/wheels/nixl/
+
+# --no-deps on triton: upstream triton has no ROCm 10.1 build, and
+# letting pip resolve it as a transitive dependency would shadow ours.
+#
+# nixl here is our nixl-rocm wheel. LMCache's own `nixl` extra pins the
+# PyPI `nixl` meta-package, which installs the CUDA backends — that
+# extra is deliberately never used in this image; the wheel installed
+# here provides the same top-level `nixl` module.
+RUN pip install --no-cache-dir --no-deps /opt/wheels/triton/*.whl && \
+    pip install --no-cache-dir /opt/wheels/nixl/*.whl && \
+    python -c "import triton; print('triton', triton.__version__)" && \
+    python -c "from nixl._api import nixl_agent; print('nixl ok')"
+
+# A pip constraint pinning torch and triton to exactly what is installed.
+# LMCache's common.txt names a bare `torch`, and its transitive closure
+# names more; the versions on PyPI are CUDA builds. Without this, one
+# `pip install` deep in the graph silently replaces the ROCm torch this
+# pipeline exists to produce, and the failure surfaces much later as a
+# missing HIP runtime. With it, that resolution fails loudly instead.
+RUN python - <<'PY' > /etc/pip-constraints.txt
+import importlib.metadata as md
+for name in ("torch", "triton"):
+    try:
+        print(f"{name}=={md.version(name)}")
+    except md.PackageNotFoundError:
+        pass
+PY
+RUN cat /etc/pip-constraints.txt
+ENV PIP_CONSTRAINT=/etc/pip-constraints.txt
+
+# ─── Builder ─────────────────────────────────────────────────────
+FROM deps AS builder
+
+ARG LMCACHE_REF=v0.5.6
+ARG SCCACHE_WEBDAV_ENDPOINT=http://snoc-strix.fold-leaffish.ts.net:8081
+# Key namespace within the shared store, and a unix socket rather than a
+# TCP port — the builders run with --driver-opt network=host, so a fixed
+# SCCACHE_SERVER_PORT is shared by every container on the node and two
+# builds' sccache servers cross. See the long note in Dockerfile.aiter.
+ARG SCCACHE_WEBDAV_KEY_PREFIX=rocm-pytorch
+ARG MAX_JOBS=
+
+LABEL org.opencontainers.image.source="https://github.com/LMCache/LMCache"
+LABEL org.opencontainers.image.description="LMCache ${LMCACHE_REF} for ROCm ${ROCM_VERSION}, ${PYTORCH_ROCM_ARCH}"
+
+ENV SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT} \
+    SCCACHE_SERVER_UDS=/tmp/sccache.sock \
+    SCCACHE_WEBDAV_KEY_PREFIX=${SCCACHE_WEBDAV_KEY_PREFIX} \
+    SCCACHE_IGNORE_CLIENT_VERSION=1 \
+    SCCACHE_CONF=/etc/sccache.toml
+
+ARG SCCACHE_VERSION=0.19.0
+RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    -o /tmp/sccache.tar.gz && \
+    tar xzf /tmp/sccache.tar.gz -C /usr/local/bin --strip-components=1 \
+        "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" && \
+    rm /tmp/sccache.tar.gz && chmod +x /usr/local/bin/sccache && sccache --version
+
+RUN printf 'server_startup_timeout_ms = 60000\n' > /etc/sccache.toml
+
+RUN git clone --depth 1 --branch ${LMCACHE_REF} \
+    https://github.com/LMCache/LMCache.git /opt/lmcache
+
+WORKDIR /opt/lmcache
+
+# setup.py bakes requirements/common.txt and requirements/rocm_core.txt
+# straight into the wheel's install_requires, so anything unresolvable
+# left in them becomes a permanently unusable wheel rather than a failed
+# build step. Patch them before building, not after.
+#
+# What goes and why:
+#   cufile-python, nvtx   CUDA-only; there is no ROCm equivalent to install
+#   cupy-rocm-7-0         (rocm_core.txt) a ROCm 7.0 build, wrong major for
+#                         ROCm 10.1 and no cp314 wheel; LMCache only uses
+#                         cupy for its optional cupy-backed allocator
+#   numpy<=2.2.6          upper-capped for NIXL's numba, which on cp314
+#                         needs a numpy newer than the cap allows. The cap
+#                         is lifted rather than the version pinned down.
+ARG LMCACHE_DROP_REQS='^(cufile-python|nvtx|cupy-rocm-7-0|grpcio-observability)([<=>;\[[:space:]]|$)'
+
+RUN cp requirements/common.txt /tmp/common.txt.orig && \
+    sed -i -E "/${LMCACHE_DROP_REQS}/d" requirements/common.txt && \
+    sed -i -E "/${LMCACHE_DROP_REQS}/d" requirements/rocm_core.txt && \
+    sed -i -E 's/^numpy<=2\.2\.6$/numpy/' requirements/common.txt && \
+    echo "--- patched requirements ---" && \
+    diff /tmp/common.txt.orig requirements/common.txt || true && \
+    cat requirements/rocm_core.txt
+
+# grpcio-tools is what generates the multiprocess transport's stubs; the
+# build_py override in setup.py runs the generator, so it is a hard build
+# dependency for the MP deployment, not an optional one.
+RUN pip install --no-cache-dir -r requirements/build.txt && \
+    python -c "import grpc_tools; print('grpc_tools ok')"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# BUILD_WITH_HIP=1 selects setup_extensions/build_profiles/rocm.py, which
+# hipifies csrc/cuda and builds lmcache.cuda_ops through torch's
+# cpp_extension with hipcc.
+#
+# HIPCC_COMPILE_FLAGS_APPEND carries the --offload-arch list: the ROCm
+# profile builds a plain CppExtension rather than a CUDAExtension, so
+# torch does not derive the arch flags from PYTORCH_ROCM_ARCH on its own
+# and hipcc would otherwise compile for its built-in default.
+#
+# No sccache here. hipcc is invoked by torch's cpp_extension rather than
+# by CMake, so the CMAKE_*_COMPILER_LAUNCHER hooks the other targets use
+# do not apply; the extension is a dozen files and compiles in minutes.
+# njobs, not MAX_JOBS, for the computation: MAX_JOBS is a build ARG, so
+# BuildKit substitutes every ${MAX_JOBS} in this instruction with the
+# ARG's value before the shell runs — assigning to it in the shell does
+# not change what the later expansions were replaced with. Compute into
+# a name BuildKit does not know about, then export it once.
+RUN njobs="${MAX_JOBS}"; \
+    if [ -z "${njobs}" ]; then \
+        cores=$(nproc); \
+        njobs=$(awk '/^MemAvailable:/ {print int($2/1024/1024/2)}' /proc/meminfo); \
+        [ -n "${njobs}" ] || njobs=${cores}; \
+        [ "${njobs}" -ge 1 ] || njobs=1; \
+        [ "${njobs}" -le "${cores}" ] || njobs=${cores}; \
+    fi; \
+    export MAX_JOBS="${njobs}"; \
+    echo "MAX_JOBS=${njobs}"; \
+    offload_flags="$(printf '%s' "${PYTORCH_ROCM_ARCH}" \
+        | sed 's/;/ --offload-arch=/g; s/^/--offload-arch=/')"; \
+    echo "hipcc offload flags: ${offload_flags}"; \
+    SETUPTOOLS_SCM_PRETEND_VERSION="${LMCACHE_REF#v}" \
+    HIPCC_COMPILE_FLAGS_APPEND="${offload_flags}" \
+    BUILD_WITH_HIP=1 CXX=hipcc \
+    PYTHONDONTWRITEBYTECODE=1 python setup.py bdist_wheel --dist-dir=/wheels \
+    2>&1 | tee /wheels-build.log
+
+SHELL ["/bin/sh", "-c"]
+
+# The extension must carry code objects for the arch it claims. A wheel
+# built for the wrong gfx imports cleanly and dies at the first kernel
+# launch, a long way from this build.
+RUN --mount=type=tmpfs,target=/tmp/lmcache-wheel \
+    set -eu; \
+    test "$(find /wheels -maxdepth 1 -name '*.whl' | wc -l)" -eq 1; \
+    python -m zipfile -e /wheels/*.whl /tmp/lmcache-wheel; \
+    so=$(find /tmp/lmcache-wheel -type f -name 'cuda_ops*.so' | head -1); \
+    test -n "${so}"; \
+    /opt/rocm/llvm/bin/llvm-objdump --offloading "${so}" \
+        | grep -oE 'gfx[0-9a-z]+' | sort -u | tee /wheels-arch.txt; \
+    for arch in $(echo "${PYTORCH_ROCM_ARCH}" | tr ';' ' '); do \
+        grep -qx "${arch}" /wheels-arch.txt || { \
+            echo "wheel has no code objects for ${arch}" >&2; exit 1; }; \
+    done
+
+RUN ls -la /wheels/
+
+# ─── Multi-process runtime image ─────────────────────────────────
+FROM deps AS final
+
+ARG LMCACHE_REF=v0.5.6
+ARG PYTORCH_ROCM_ARCH
+ARG ROCM_VERSION
+
+LABEL org.opencontainers.image.source="https://github.com/LMCache/LMCache"
+LABEL org.opencontainers.image.description="LMCache ${LMCACHE_REF} multi-process runtime for ROCm ${ROCM_VERSION}, ${PYTORCH_ROCM_ARCH}"
+
+COPY --from=builder /wheels/ /opt/wheels/lmcache/
+COPY --from=builder /wheels-build.log /wheels-arch.txt /var/log/lmcache-build/
+COPY --from=builder /opt/lmcache/requirements/ /opt/lmcache-requirements/
+
+# --ignore-requires-python: LMCache v0.5.6 declares requires-python
+# ">=3.10,<3.14" and this lane is cp314, because Ubuntu 26.04 — the only
+# base AMD publishes ROCm 10.1 for — ships no other Python. The cap is a
+# support statement rather than a technical one; the extension is built
+# here against this interpreter, so the ABI matches by construction.
+# Revisit when upstream raises the bound.
+#
+# --no-deps on the wheel itself, with the patched requirements installed
+# first: pip would otherwise re-resolve install_requires and reintroduce
+# the CUDA-only entries stripped during the build.
+RUN pip install --no-cache-dir -r /opt/lmcache-requirements/common.txt && \
+    pip install --no-cache-dir -r /opt/lmcache-requirements/rocm_core.txt && \
+    pip install --no-cache-dir --no-deps --ignore-requires-python \
+        /opt/wheels/lmcache/*.whl && \
+    python -c "import lmcache; from lmcache import cuda_ops; print('LMCache', lmcache.__version__)" && \
+    python -c "import torch; assert torch.version.hip, 'torch lost its HIP build'"
+
+# The multiprocess transport's gRPC stubs are generated into the wheel at
+# build time; importing the server module is what proves they landed.
+RUN python -c "import lmcache.v1.server.__main__; import lmcache.v1.api_server.__main__; print('MP entrypoints ok')"
+
+ENV HSA_OVERRIDE_GFX_VERSION=11.0.2
+
+# 9000 is lmcache_controller's argparse default. 8100 is a convention,
+# not a default — lmcache_server has no default port, it requires one
+# positionally. Change it freely; it is documentation, not a binding.
+EXPOSE 9000 8100
+
+# ENTRYPOINT is reset because the parent image sets ENTRYPOINT
+# ["python"], which would make every argument below a script name. An
+# empty entrypoint lets a container pick its role directly.
+#
+# The two server CLIs are NOT symmetric, which is an easy and silent
+# mistake to make. lmcache_controller is argparse and takes flags;
+# lmcache_server (lmcache/v1/server/__main__.py) parses sys.argv by
+# position — `if len(sys.argv) not in [3, 4]: usage; exit(1)` — so the
+# flag form logs a usage line and exits 1 before binding anything:
+#
+#   docker run <img> lmcache_controller --host 0.0.0.0 --port 9000
+#   docker run <img> lmcache_server 0.0.0.0 8100 cpu   # host port storage
+#   docker run <img> lmcache --help
+ENTRYPOINT []
+CMD ["lmcache_controller", "--help"]
+
+# ─── Wheel-only image ────────────────────────────────────────────
+FROM scratch AS wheel
+
+ARG LMCACHE_REF
+ARG PYTORCH_ROCM_ARCH
+LABEL org.opencontainers.image.source="https://github.com/LMCache/LMCache"
+LABEL org.opencontainers.image.description="LMCache ${LMCACHE_REF} wheel for ${PYTORCH_ROCM_ARCH}"
+
+COPY --from=builder /wheels/ /wheels/
+COPY --from=builder /wheels-build.log /wheels-arch.txt /

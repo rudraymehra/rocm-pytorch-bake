@@ -1,0 +1,320 @@
+# syntax=docker/dockerfile:1
+# vLLM (github.com/vllm-project/vllm) built against this repo's ROCm
+# 10.1 PyTorch, Triton and AITER, with NIXL for KV-cache transfer.
+#
+# Why build it: AMD publishes rocm/vllm-dev images, but they are built
+# against AMD's own torch for ROCm 7.x. Ours is torch 2.14.1 on ROCm
+# 10.1 for gfx950, and vLLM's HIP extensions link against torch's C++
+# ABI — a prebuilt vLLM wheel and our torch cannot share a process.
+#
+# Why it builds FROM the PyTorch image rather than the ROCm base: the
+# same reason as Dockerfile.aiter. setup.py imports torch to pick up the
+# HIP toolchain and the ABI flags, so torch has to be present before the
+# build starts, not installed alongside it.
+#
+# This file produces two things from one builder: a runnable serving
+# image (`final`) and a scratch image carrying just the wheel (`wheel`),
+# matching the split in Dockerfile.pytorch.
+
+ARG PYTORCH_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/pytorch:latest
+ARG TRITON_WHEEL_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/triton-wheel:latest
+ARG AITER_WHEEL_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/aiter-wheel:latest
+ARG NIXL_WHEEL_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/nixl-wheel:latest
+
+FROM ${TRITON_WHEEL_IMAGE} AS tritonwheels
+FROM ${AITER_WHEEL_IMAGE} AS aiterwheels
+FROM ${NIXL_WHEEL_IMAGE} AS nixlwheels
+
+# ─── Build environment: torch + the accelerator wheels ───────────
+# Shared by the compile and by the final image, so both resolve the same
+# versions of triton, aiter and nixl. Splitting it out also means a
+# change to the vLLM ref does not reinstall them.
+FROM ${PYTORCH_IMAGE} AS deps
+
+ARG PYTORCH_ROCM_ARCH=gfx950
+ARG ROCM_VERSION=10.1.0-full
+
+# GPU_ARCHS is not a duplicate of PYTORCH_ROCM_ARCH. `import aiter`
+# resolves the target architecture eagerly, and with GPU_ARCHS unset it
+# falls back to "native" and shells out to rocminfo — which finds no
+# device in a BuildKit RUN and raises "No gfx arch found in rocminfo
+# output". Setting it also pins the arch at runtime rather than letting
+# it be rediscovered from whichever GPU the container lands on.
+ENV ROCM_PATH=/opt/rocm \
+    PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
+    GPU_ARCHS=${PYTORCH_ROCM_ARCH} \
+    VLLM_TARGET_DEVICE=rocm
+
+COPY --from=tritonwheels /wheels/ /opt/wheels/triton/
+COPY --from=aiterwheels  /wheels/ /opt/wheels/aiter/
+COPY --from=nixlwheels   /wheels/ /opt/wheels/nixl/
+
+# Order matters only in that triton must not be resolved from PyPI:
+# upstream triton has no ROCm 10.1 build and installing it would shadow
+# ours. --no-deps on the triton wheels keeps pip from "helpfully"
+# pulling a published triton as a transitive dependency.
+RUN pip install --no-cache-dir --no-deps /opt/wheels/triton/*.whl && \
+    pip install --no-cache-dir /opt/wheels/aiter/*.whl && \
+    pip install --no-cache-dir /opt/wheels/nixl/*.whl
+
+# AITER's wheel metadata does not carry its runtime dependencies — its
+# setup.py never folds requirements.txt into install_requires, so pip
+# installs it "successfully" and `import aiter` then dies on a missing
+# pyyaml. Fetch the list at the same ref the wheel was built from rather
+# than hand-maintaining a copy that drifts from it.
+#
+# Three entries are dropped: pytest and matplotlib are test and plotting
+# deps, and flydsl is a *build*-time dependency of AITER (it appears in
+# its pyproject [build-system].requires) whose published wheels do not
+# cover this interpreter. None of them are imported by the kernels vLLM
+# calls.
+ARG AITER_REF=v0.1.27
+ARG AITER_DROP_REQS='^(pytest|matplotlib|flydsl)([<=>;[:space:]]|$)'
+
+RUN curl -fsSL \
+        "https://raw.githubusercontent.com/ROCm/aiter/${AITER_REF}/requirements.txt" \
+        -o /tmp/aiter-requirements.txt && \
+    sed -i -E "/${AITER_DROP_REQS}/d" /tmp/aiter-requirements.txt && \
+    cat /tmp/aiter-requirements.txt && \
+    pip install --no-cache-dir -r /tmp/aiter-requirements.txt
+
+RUN python -c "import triton; print('triton', triton.__version__)" && \
+    python -c "import aiter; print('aiter ok')" && \
+    python -c "from nixl._api import nixl_agent; print('nixl ok')"
+
+# A pip constraint pinning torch and triton to exactly what is installed.
+# Several entries in vLLM's requirement files, and in the transitive
+# closure below them, name torch or triton — and the versions they name
+# exist on PyPI as CUDA builds. Without this, one `pip install` deep in
+# the dependency graph silently replaces the ROCm torch this whole
+# pipeline exists to produce, and the failure surfaces much later as a
+# missing HIP runtime. With it, that resolution fails loudly instead.
+RUN python - <<'PY' > /etc/pip-constraints.txt
+import importlib.metadata as md
+for name in ("torch", "triton"):
+    try:
+        print(f"{name}=={md.version(name)}")
+    except md.PackageNotFoundError:
+        pass
+PY
+RUN cat /etc/pip-constraints.txt
+ENV PIP_CONSTRAINT=/etc/pip-constraints.txt
+
+# vLLM's ROCm platform layer imports amdsmi to enumerate devices. It is
+# not on PyPI for ROCm 10.1; it ships inside the ROCm installation.
+#
+# `pip install /opt/rocm/share/amd_smi` is what older ROCm images
+# supported and what most guides still say, but ROCm 10.1 ships that
+# directory with no setup.py and no pyproject.toml — pip rejects it as
+# "not installable". The package itself is complete and binds to
+# libamd_smi.so through ctypes, so putting it on sys.path is enough. A
+# .pth file does that without copying the tree or shadowing the ROCm
+# installation's own copy.
+RUN set -eu; \
+    test -d /opt/rocm/share/amd_smi/amdsmi; \
+    sp=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])"); \
+    printf '/opt/rocm/share/amd_smi\n' > "${sp}/rocm-amdsmi.pth"; \
+    python -c "import amdsmi; print('amdsmi ok:', amdsmi.__file__)"
+
+# ─── Builder ─────────────────────────────────────────────────────
+FROM deps AS builder
+
+ARG VLLM_REF=v0.32.0
+ARG SCCACHE_WEBDAV_ENDPOINT=http://snoc-strix.fold-leaffish.ts.net:8081
+# Key namespace within the shared store, and a unix socket rather than a
+# TCP port — the builders run with --driver-opt network=host, so a fixed
+# SCCACHE_SERVER_PORT is shared by every container on the node and two
+# builds' sccache servers cross. See the long note in Dockerfile.aiter.
+ARG SCCACHE_WEBDAV_KEY_PREFIX=rocm-pytorch
+# Empty means "derive from the node"; set it to pin a job count.
+ARG MAX_JOBS=
+# vLLM v0.32 builds a Rust extension (vllm/vllm-rs) as part of setup.py.
+# The channel tracks the repo's rust-toolchain.toml.
+ARG RUST_VERSION=1.95
+
+LABEL org.opencontainers.image.source="https://github.com/vllm-project/vllm"
+LABEL org.opencontainers.image.description="vLLM ${VLLM_REF} for ROCm ${ROCM_VERSION}, ${PYTORCH_ROCM_ARCH}"
+
+ENV SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT} \
+    SCCACHE_SERVER_UDS=/tmp/sccache.sock \
+    SCCACHE_WEBDAV_KEY_PREFIX=${SCCACHE_WEBDAV_KEY_PREFIX} \
+    SCCACHE_IGNORE_CLIENT_VERSION=1 \
+    SCCACHE_CONF=/etc/sccache.toml \
+    CMAKE_C_COMPILER_LAUNCHER=sccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=sccache \
+    CMAKE_HIP_COMPILER_LAUNCHER=sccache \
+    CARGO_HOME=/opt/cargo \
+    RUSTUP_HOME=/opt/rustup \
+    PATH=/opt/cargo/bin:${PATH}
+
+ARG SCCACHE_VERSION=0.19.0
+RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    -o /tmp/sccache.tar.gz && \
+    tar xzf /tmp/sccache.tar.gz -C /usr/local/bin --strip-components=1 \
+        "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" && \
+    rm /tmp/sccache.tar.gz && chmod +x /usr/local/bin/sccache && sccache --version
+
+# The 10s server-startup probe compiled into sccache is not enough when
+# the node hosting the WebDAV store is itself building; see the same
+# note in Dockerfile.triton.
+RUN printf 'server_startup_timeout_ms = 60000\n' > /etc/sccache.toml
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libnuma-dev \
+    libdnnl-dev \
+    libmsgpack-dev \
+    libsqlite3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh && \
+    sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
+        --default-toolchain ${RUST_VERSION} && \
+    rm /tmp/rustup-init.sh && cargo --version
+
+RUN git clone --depth 1 --branch ${VLLM_REF} \
+    https://github.com/vllm-project/vllm.git /opt/vllm
+
+WORKDIR /opt/vllm
+
+# requirements/rocm.txt mixes three things: runtime deps, test deps, and
+# optional feature deps. Several of the optional ones have no wheel for
+# cp314 or no ROCm 10.1 build at all, and a single unresolvable pin
+# fails the whole install — so they are stripped rather than allowed to
+# decide whether this image exists.
+#
+# What goes and why:
+#   tensorizer, runai-model-streamer  alternate model loaders, x86 wheels only
+#   amd-quark                         Quark quantization, ROCm 7.x builds
+#   tilelang, apache-tvm-ffi          optional kernel DSL, no cp314 wheel
+#   mooncake-transfer-engine-rocm     a second KV transport; we use NIXL
+#   datasets, peft, pytest-asyncio    test-suite deps, not serving deps
+#
+# Override VLLM_DROP_REQS to keep any of them once a usable wheel exists.
+ARG VLLM_DROP_REQS='^(tensorizer|runai-model-streamer|amd-quark|tilelang|apache-tvm-ffi|mooncake-transfer-engine-rocm|datasets|peft|pytest-asyncio)([<=>\[[:space:]]|$)'
+
+RUN cp requirements/rocm.txt /tmp/rocm.txt.orig && \
+    sed -i -E "/${VLLM_DROP_REQS}/d" requirements/rocm.txt && \
+    echo "--- dropped from requirements/rocm.txt ---" && \
+    diff /tmp/rocm.txt.orig requirements/rocm.txt || true
+
+# requirements/build/rocm.txt is deliberately NOT used: it pins torch,
+# torchvision and triton from AMD's repo.amd.com index (ROCm 7.14), which
+# would replace every wheel this image is built around. This is that file
+# with the toolchain entries kept and the framework pins dropped. cmake is
+# capped below 4 for the same reason upstream caps it — vLLM's ROCm CMake
+# path does not survive the 4.x policy changes.
+RUN pip install --no-cache-dir \
+        "cmake>=3.26.1,<4" ninja "packaging>=24.2" \
+        "setuptools>=78.1.1,<80.0.0" "setuptools-scm>=8" \
+        "setuptools-rust>=1.9.0" wheel "jinja2>=3.1.6" "timm>=1.0.17"
+
+RUN pip install --no-cache-dir -r requirements/rocm.txt && \
+    python -c "import torch; print('torch still', torch.__version__, torch.version.hip)"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# setup.py directly, not `python -m build`: vLLM pins torch == 2.13.0 in
+# [build-system].requires, which a PEP 517 front end verifies and ours
+# does not satisfy. Nothing in the HIP build depends on that exact
+# minor — the pin exists to stop PyPI resolving a mismatched torch for
+# people who are not supplying their own. Upstream's own ROCm
+# Dockerfile calls setup.py for the same reason.
+#
+# The clone is shallow and tag-pinned, so setuptools_scm can see the tag
+# but not the depth of history it wants; pretending the version keeps
+# the wheel name from becoming 0.1.dev1+unknown.
+#
+# njobs, not MAX_JOBS, for the computation: MAX_JOBS is a build ARG, so
+# BuildKit substitutes every ${MAX_JOBS} in this instruction with the
+# ARG's value before the shell runs — assigning to it in the shell does
+# not change what the later expansions were replaced with. Compute into
+# a name BuildKit does not know about, then export it once.
+RUN njobs="${MAX_JOBS}"; \
+    if [ -z "${njobs}" ]; then \
+        cores=$(nproc); \
+        njobs=$(awk '/^MemAvailable:/ {print int($2/1024/1024/2)}' /proc/meminfo); \
+        [ -n "${njobs}" ] || njobs=${cores}; \
+        [ "${njobs}" -ge 1 ] || njobs=1; \
+        [ "${njobs}" -le "${cores}" ] || njobs=${cores}; \
+        echo "MAX_JOBS=${njobs} (from ${cores} cores, $(awk '/^MemAvailable:/ {printf "%.0fGB", $2/1048576}' /proc/meminfo) available)"; \
+    else \
+        echo "MAX_JOBS=${njobs} (pinned via build arg)"; \
+    fi; \
+    export MAX_JOBS="${njobs}"; \
+    export SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_REF#v}"; \
+    export VLLM_DOCKER_BUILD_CONTEXT=1; \
+    PYTHONDONTWRITEBYTECODE=1 python setup.py bdist_wheel --dist-dir=/wheels \
+    2>&1 | tee /wheels-build.log \
+    && sccache --show-stats | tee /wheels-sccache-stats.txt
+
+SHELL ["/bin/sh", "-c"]
+
+# The ROCm extension must actually carry code objects for the arch this
+# was built for. A mismatched PYTORCH_ROCM_ARCH produces a wheel that
+# imports cleanly and then fails at the first kernel launch on a real
+# GPU, which is a long way from here.
+RUN --mount=type=tmpfs,target=/tmp/vllm-wheel \
+    set -eu; \
+    python -m zipfile -e /wheels/*.whl /tmp/vllm-wheel; \
+    so=$(find /tmp/vllm-wheel -type f -name '_C*.so' | head -1); \
+    test -n "${so}"; \
+    echo "checking offload bundles in ${so}"; \
+    /opt/rocm/llvm/bin/llvm-objdump --offloading "${so}" \
+        | grep -oE 'gfx[0-9a-z]+' | sort -u | tee /wheels-arch.txt; \
+    for arch in $(echo "${PYTORCH_ROCM_ARCH}" | tr ';' ' '); do \
+        grep -qx "${arch}" /wheels-arch.txt || { \
+            echo "wheel has no code objects for ${arch}" >&2; exit 1; }; \
+    done
+
+RUN ls -la /wheels/
+
+# ─── Serving image ───────────────────────────────────────────────
+# FROM deps, not from builder: the builder carries a Rust toolchain, a
+# vLLM source tree and a CMake build directory that together outweigh
+# the wheel by an order of magnitude.
+FROM deps AS final
+
+ARG VLLM_REF=v0.32.0
+ARG PYTORCH_ROCM_ARCH
+ARG ROCM_VERSION
+
+LABEL org.opencontainers.image.source="https://github.com/vllm-project/vllm"
+LABEL org.opencontainers.image.description="vLLM ${VLLM_REF} serving image for ROCm ${ROCM_VERSION}, ${PYTORCH_ROCM_ARCH}"
+
+COPY --from=builder /wheels/ /opt/wheels/vllm/
+COPY --from=builder /wheels-build.log /wheels-sccache-stats.txt /wheels-arch.txt \
+    /var/log/vllm-build/
+# The patched requirements, not the originals: installing the wheel's
+# own metadata would re-resolve the dependencies this build deliberately
+# dropped, and pull a CUDA torch in with them.
+COPY --from=builder /opt/vllm/requirements/ /opt/vllm-requirements/
+
+RUN pip install --no-cache-dir -r /opt/vllm-requirements/rocm.txt && \
+    pip install --no-cache-dir --no-deps /opt/wheels/vllm/*.whl && \
+    python -c "import vllm; print('vLLM', vllm.__version__)" && \
+    python -c "import torch; assert torch.version.hip, 'torch lost its HIP build'"
+
+# AITER is installed but not switched on by default: it replaces several
+# attention and MoE kernels, and which of them are faster depends on the
+# model and the shape. Turn it on per-run with VLLM_ROCM_USE_AITER=1.
+ENV HSA_OVERRIDE_GFX_VERSION=11.0.2 \
+    SAFETENSORS_FAST_GPU=1
+
+EXPOSE 8000
+
+# `vllm`, not `python`: the parent image sets ENTRYPOINT ["python"], and
+# inheriting that here would make `docker run <img> serve <model>` try to
+# run a script called "serve".
+ENTRYPOINT ["vllm"]
+CMD ["--help"]
+
+# ─── Wheel-only image ────────────────────────────────────────────
+FROM scratch AS wheel
+
+ARG VLLM_REF
+ARG PYTORCH_ROCM_ARCH
+LABEL org.opencontainers.image.source="https://github.com/vllm-project/vllm"
+LABEL org.opencontainers.image.description="vLLM ${VLLM_REF} wheel for ${PYTORCH_ROCM_ARCH}"
+
+COPY --from=builder /wheels/ /wheels/
+COPY --from=builder /wheels-build.log /wheels-sccache-stats.txt /wheels-arch.txt /
