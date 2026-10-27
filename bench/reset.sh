@@ -15,9 +15,19 @@ set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 IFS=, read -r -a levels <<< "${1:?usage: bench/reset.sh BK,SC,RG,OS}"
 
+# The BK and RG levels delete directory contents: refuse anything that is not
+# clearly a dedicated data directory.
+safe_dir() {
+    case "$1" in
+        ""|/|/root|/home|/var|/usr|/usr/*|/etc|/etc/*|/boot|/boot/*|"$HOME") echo "refusing to wipe '$1'" >&2; exit 2 ;;
+    esac
+    [ -d "$1" ] || { echo "'$1' is not a directory" >&2; exit 2; }
+}
+
 for level in "${levels[@]}"; do
     case "$level" in
         BK)
+            safe_dir "$STATE_DIR"
             docker rm -f buildkitd >/dev/null
             find "$STATE_DIR" -mindepth 1 -delete
             echo "BK proof: $(du -sh "$STATE_DIR" | cut -f1) in $STATE_DIR"
@@ -26,11 +36,13 @@ for level in "${levels[@]}"; do
         SC)
             # shellcheck source=/dev/null
             . "$SECRETS/valkey-admin.env"
-            cli=(docker exec rpb-cache-valkey-1 valkey-cli -h "$VALKEY_HOST" --user "$VALKEY_USER" --pass "$VALKEY_PASSWORD" --no-auth-warning)
+            export VALKEYCLI_AUTH=$VALKEY_PASSWORD   # not on the command line (visible in ps)
+            cli=(docker exec -e VALKEYCLI_AUTH rpb-cache-valkey-1 valkey-cli -h "$VALKEY_HOST" --user "$VALKEY_USER")
             "${cli[@]}" flushall >/dev/null
             echo "SC proof: dbsize=$("${cli[@]}" dbsize)"
             ;;
         RG)
+            safe_dir "$CACHE_DATA"
             docker compose -f "$repo/infra/cache-node/compose.yaml" stop zot >/dev/null
             find "$CACHE_DATA/zot" -mindepth 1 -delete
             docker compose -f "$repo/infra/cache-node/compose.yaml" start zot >/dev/null
