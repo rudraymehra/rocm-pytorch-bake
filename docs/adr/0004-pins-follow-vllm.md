@@ -4,9 +4,9 @@ Status: accepted until the reviewer answers Q1–Q3
 
 ## Decision
 
-ROCm SDK, torch version, Triton, AITER, FlashAttention and LMCache defaults are
-copied from vLLM's ROCm Dockerfiles at the pinned vLLM commit. Torch is built
-from source at the matching upstream tag.
+ROCm SDK, torch version, torchvision version, Triton, AITER, FlashAttention and
+LMCache defaults are copied from vLLM's ROCm Dockerfiles at the pinned vLLM
+commit. Torch and torchvision are built from source at the matching upstream tags.
 
 ## Consequences
 

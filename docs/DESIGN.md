@@ -1,17 +1,17 @@
-# rocm-pytorch-bake: Design Proposal
+# rocm-pytorch-bake: Design
 
-**Status:** Draft for review (v2: incorporates your six points of 26 Oct)
+**Status:** v3, matches the code on the `dev` branch (v2 incorporated your six points of 26 Oct; Section 10 lists what changed since)
 **Author:** Rudray Mehra
 **Reviewer:** Stephen Bates
-**Last updated:** 27 October 2026
+**Last updated:** 28 October 2026
 
 ---
 
 ## 1. Summary
 
-Build PyTorch, vLLM and LMCache from source for a single AMD GPU target, with the fastest possible cold build, a warm build that reuses nearly everything, and minimal wheels for deployment. The build is driven by one top-level `docker-bake.hcl` and runs on remote BuildKit builders, one per machine, each configured by a shared `buildkitd.toml`. Two caches serve the whole cluster: a zot registry on one node for layer caching, and a Redis-backed sccache on one node for compile caching. Timing and cache hit rates come from BuildKit build history (`docker buildx history`) plus sccache statistics, and go into Prometheus. The repo has CI from the first commit, and the results are benchmarked on EC2 so anyone can reproduce them.
+Build PyTorch, vLLM and LMCache (with torchvision, Triton, AITER and FlashAttention) from source for a single AMD GPU target, with the fastest possible cold build, a warm build that reuses nearly everything, and minimal wheels for deployment. The build is driven by one top-level `docker-bake.hcl` and runs on remote BuildKit builders, one per machine, each configured by a shared `buildkitd.toml`. Two caches serve the whole cluster: a zot registry on one node for layer caching, and a Redis-backed sccache on one node for compile caching. Timing and cache hit rates come from BuildKit build history (`docker buildx history`) plus sccache statistics, and go into Prometheus. The repo has CI from the first commit, and the results are benchmarked on EC2 so anyone can reproduce them.
 
-This document lays out the proposed design, the evidence behind each choice, and the questions I need your input on before writing code.
+This document describes the design as implemented, the evidence behind each choice, and the questions that are still open. What has been tested, and what has not yet, is in `docs/TESTING.md`.
 
 ## 2. Goals and non-goals
 
@@ -59,29 +59,29 @@ Nobody has published a sccache hit rate or a cold/warm breakdown for a ROCm PyTo
 ### 4.1 Top-level bake file and pins
 
 ```text
-docker-bake.hcl            the one top-level file: pins, knobs, functions, targets, groups
-docker-bake.override.hcl   per site, gitignored: zot address, Redis secret file, MAX_JOBS
-docker/*.Dockerfile        one per component
-buildkit/buildkitd.toml    shared builder config (Section 4.5)
+docker-bake.hcl                 the one top-level file: pins, knobs, functions, targets, groups
+rpb.env.example                 per-site values as environment variables (zot address, Redis secret file, job counts)
+docker/*.Dockerfile             one per component
+infra/buildkit/buildkitd.toml   shared builder config (Section 4.5)
+infra/cache-node/, infra/monitoring/, infra/certs/, infra/ec2/   the cluster and the EC2 hosts
+scripts/, telemetry/            the build wrapper and the run records (Section 4.8)
 ```
 
-- **One file holds everything versioned.** `docker buildx bake` reads only `docker-bake.hcl` and `docker-bake.override.hcl` automatically (`bake/bake.go`), and bake HCL has no include. Pins in a separate file would silently drop out of any run without `-f`. Your branch and AIC main already keep pins as variables in the bake file; this follows that.
-- **Pins:** ROCm, torch, vLLM, LMCache, Triton, AITER, FlashAttention, sccache and BuildKit, each as a ref plus a full commit SHA. Every variable can be overridden by environment variable or `--var`.
+- **One file holds every source pin.** Bake HCL has no include, so pins in a second HCL file would need `-f` (or `BUILDX_BAKE_FILE`) on every run, and a run that forgot it would silently use other versions. Your branch and AIC main already keep pins as variables in the bake file; this follows that. Tool and image pins (BuildKit, zot, Valkey, Prometheus and others) live where they are used; `docs/PINS.md` lists every one.
+- **Source pins:** torch, torchvision, Triton, AITER, FlashAttention, LMCache and vLLM, each as a ref plus a full commit SHA; also the ROCm SDK version, the base image by digest, and sccache by version and tarball sha256. Every variable can be set by environment variable or `--var`, which keeps its type and validation (re-declaring it in an override file would not).
 - **What makes the file worth reading:**
-  - Typed variables with `validation` blocks: `GPU_ARCH` must be exactly one gfx target, and every SHA must be 40 hex characters. A bad value fails at parse time, before anything builds.
+  - Typed variables with `validation` blocks: `GPU_ARCH` must be exactly one of gfx90a, gfx942 and gfx950 (the targets AITER and FlashAttention support), every SHA must be 40 hex characters, job counts must be positive whole numbers, and `VLLM_VERSION` must match `VLLM_SHA`. A bad value fails at parse time, before anything builds.
   - Functions generate the zot `cache-from` and `cache-to` refs per target, so cache naming is defined in one place.
-  - One `matrix` target generates the downstream stages with their `target:` links.
+  - A `matrix` target generates the BuildKit lint checks of every Dockerfile; each build target is written out with its `target:` links (`scripts/bake-graph` prints the graph).
   - `description` on every variable and target, so `docker buildx bake --list=variables` documents the knobs.
   - `lint` and `smoke` targets for CI (Section 4.11).
 - **Secrets** (the Redis credentials) enter through the bake `secret` attribute and `RUN --mount=type=secret`, never as `ARG`. They stay out of layers, provenance and cache keys.
 - Sources are fetched with `ADD --checksum=<sha> <git url>`. The build fails if a tag and SHA disagree, and BuildKit fetches submodules itself. This also covers AIC issue #143 (re-cloning on every build).
 - Each version `ARG` is declared only in the stage that uses it, so changing one pin does not invalidate unrelated stages.
-- A single pin hash goes into image tags and the run record, but **not** into cache refs, so a pin bump still finds the previous cache.
+- Cache refs carry the target, gfx target, ROCm SDK and Python versions, but **not** the source pins, so a pin bump still finds the previous cache. The run record carries every pin.
 - Patches live under `patches/<package>/` and are applied in file-name order.
 - vLLM is pinned to a commit that includes PR #62475, which splits the slow attention compile into parallel units (547 s on one core down to 72 s wall on 12 cores, gfx950).
 - Requires buildx v0.38 or later, for `bake --jobs` (Section 4.2).
-
-A tested sketch of the file (validation, cache functions and the stage matrix parse and resolve with `--print` on buildx v0.38.1) is kept with the research notes and will be the first commit.
 
 ### 4.2 Stage graph
 
@@ -90,25 +90,26 @@ fetch sources (URL + SHA)
         |
 hipify + patches          (does not depend on the ROCm image)
         |
-torch compile  -> torch wheel
+torch compile  -> torch wheel          Triton builds in parallel from the start
+        |                                (no torch dependency)
+torch-core (torch + Triton installed) -> torchvision wheel
         |
-torch-dev image  ----> pushed to zot, used by other machines
+torch-dev image (+ torchvision) ----> pushed to zot, used by other machines
         |
    +----+-------+-----------+-----------+
    |            |           |           |
  vLLM native  AITER   FlashAttention  LMCache
+ vLLM Rust frontend (from base, in parallel)
    |
  vLLM python packaging (cheap, reuses native .so)
-
-Triton builds in parallel from the start (no torch dependency)
 
 All wheels exported via FROM scratch stages (type=local)
 ```
 
-- The native vLLM compile is keyed only on native inputs (vLLM's own `csrc-build` pattern), so a Python-only edit does not recompile kernels.
+- The native vLLM compile is keyed on the two ROCm requirement files and the native sources only (vLLM's own `csrc-build` pattern), so a Python-only edit or a version-string change does not recompile kernels.
 - Inside each stage: stable, expensive steps first; patches and scripts last; narrow `COPY` paths.
 - `bake --jobs=defer-error`, so that when one target fails, the others still finish and save their cache. No `parallel=N` limit: buildx rejects limited parallelism when targets are linked through `target:` contexts.
-- Concurrency per machine is bounded twice: BuildKit's `max-parallelism` limits concurrent build steps (Section 4.5), and each target gets an explicit `MAX_JOBS` share for the compiler threads inside its step.
+- Concurrency per machine is bounded twice: BuildKit's `max-parallelism` limits concurrent build steps (Section 4.5), and each target gets an explicit job count for the compiler threads inside its step (`MAX_JOBS` for torch, `FANOUT_JOBS` for each other target). Job counts are part of the layer cache key, so every builder of one host class uses the same values.
 - **One Dockerfile per component, linked by `target:` contexts.** Your branch uses a single multi-stage Dockerfile, which Docker's docs also prefer. Separate files let each component's cache and owner be independent and let the torch-dev image be handed between machines through zot. Either works with this design (Q4).
 - Estimated cold time on one 32 to 64 core builder: **40 to 75 minutes**, with torch taking 50 to 80% of it. This is an estimate until measured, and it assumes no AITER kernel prebuild.
 - If AITER kernel prebuild is required, AITER, not torch, may set the critical path. AIC's own patch notes measure 61 minutes for about 107 modules on 128 cores, with a three-module tail running over 85 minutes on its own (`patches/aiter/03-aiter-prebuild-threads.py`, PR #186).
@@ -123,7 +124,7 @@ builder 3 ──┘
 
 - **Tool:** sccache v0.19.0. ccache is kept only as a comparison arm, to reproduce your prototype's numbers.
 - **Chain:** `SCCACHE_MULTILEVEL_CHAIN=disk,redis`. A per-target BuildKit cache mount is the fast local level; one Redis node is the shared level for the whole cluster.
-- **Write policy `all`, not the default.** Under the default `l0` policy, writes to Redis are detached background tasks (`src/cache/multilevel.rs`, `tokio::spawn`). Each `RUN` step stops the sccache server when it ends, so pending writes can be lost and Redis fills more slowly than it should. With `SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY=all`, each compile waits for its Redis write. The cost is that sccache refuses to start when Redis is down, so the `RUN` step falls back to disk-only sccache with a warning instead of failing.
+- **Write policy `all`, not the default** (set by `scripts/rpb-sccache-run`, which refuses any other). Under the default `l0` policy, writes to Redis are detached background tasks (`src/cache/multilevel.rs`, `tokio::spawn`). Each `RUN` step stops the sccache server when it ends, so pending writes can be lost and Redis fills more slowly than it should. With `SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY=all`, each compile waits for its Redis write, and sccache checks Redis at startup. When Redis is down, the `RUN` step falls back to disk-only sccache with a warning and records `fallback` in the run record and in Prometheus; with `RPB_SCCACHE_REQUIRE_REMOTE=1` (tests and benchmarks) it fails instead.
 - **Redis server** (Valkey 9.1, the BSD-licensed Redis fork, as proposed default; plain Redis works the same, Q5):
   - `maxmemory` set explicitly (start at 32 GB, resize after the first cold build) with `allkeys-lru` eviction, so the cache can never exhaust the node.
   - No persistence (`save ""`, `appendonly no`). Snapshots fork the process and can briefly need up to twice the RAM; losing the cache costs one cold build.
@@ -138,7 +139,8 @@ builder 3 ──┘
 - **Hooked at clang, never at hipcc:**
   - torch: `CMAKE_C/CXX/HIP_COMPILER_LAUNCHER=sccache`, with `USE_CCACHE=0`.
   - vLLM: picked up automatically by its `setup.py`.
-  - LMCache, AITER and FlashAttention: `HIP_CLANG_LAUNCHER=sccache`. This needs hipcc from ROCm 7.13 or later; on the 7.2.x line it is ignored silently, so wrapper scripts are used instead.
+  - LMCache, AITER, FlashAttention and torchvision: hipcc finds clang through `HIP_CLANG_PATH`, which these steps point at two wrapper scripts (`/opt/sccache-wrappers`) that call clang through sccache. (`HIP_CLANG_LAUNCHER` would do the same but is ignored silently by hipcc before ROCm 7.13.)
+  - vLLM's Rust frontend: `RUSTC_WRAPPER=sccache`, as upstream.
 - **Settings that matter for HIP:**
   - `SCCACHE_DIRECT=false`. PyTorch main adds `--offload-compress` to every HIP compile, which makes sccache's direct mode fail the compile (sccache #2762; fix #2788 still open).
   - `SCCACHE_IDLE_TIMEOUT=0`, because some files compile for over 10 minutes.
@@ -150,10 +152,11 @@ builder 3 ──┘
 ### 4.4 Layer cache: zot on one node
 
 - zot v2.1.22 on local NVMe, plain HTTP, reachable only on the LAN or VPC. Each builder's `buildkitd.toml` marks it `http = true`.
-- One repository, with `dedupe: false` set explicitly. Dedupe is on by default and takes a store-wide write lock on blob checks (#4582).
+- Two repositories: `rpb/cache` (layer cache, every tag kept) and `rpb/torch-dev` (the image handed between machines, three newest tags kept). `dedupe: false` is set explicitly: dedupe is on by default and takes a store-wide write lock on blob checks (#4582).
 - GC with a 2-hour delay, and retention by tag count (zot has no size-based eviction).
+- HTTP read and write timeouts of 30 minutes; zot's default of 60 seconds cuts off multi-GB layer transfers.
 - Cache export settings:
-  - One cache ref per target and gfx target, generated by the bake functions, with `mode=max` and `ignore-error=true`.
+  - One cache ref per target, gfx target, ROCm SDK and Python version, generated by the bake functions, with `mode=max` and `ignore-error=true`.
   - zstd level 3 everywhere, and never mixed compression (mixing it is linked to BuildKit #6088, out of memory on export).
 - A reference cache ref written only by baseline-pin builds, listed as a fallback in every `cache-from`.
 - No `buildx prune` and no builder recreation between builds, and no NFS cache directories.
@@ -169,13 +172,13 @@ What the shared `buildkitd.toml` sets, and why:
 |---|---|---|
 | `[grpc]`, `[grpc.tls]` | TCP listener with `cert`, `key` and `ca` | Setting `ca` enforces client certificates. Build steps share the host network and could otherwise reach the daemon API. |
 | `[worker.oci]` | `max-parallelism = 8`, overlayfs | Caps concurrent build steps across all targets on the machine; compiler threads are set separately by `MAX_JOBS`. |
-| `[[worker.oci.gcpolicy]]` | Ordered rules, sized for the actual NVMe | Default GC caps the cache at 100 GB and drops idle cache mounts after 48 h. Ordered rules: git checkouts and contexts after 72 h; layers first under space pressure, since zot can restore them; cache mounts (sccache local level, pip) kept 30 days; a backstop at 75–80% disk. |
+| `[[worker.oci.gcpolicy]]` | Ordered rules, sized for the actual NVMe | Default GC caps the cache at 100 GB and drops idle cache mounts after 48 h. Ordered rules: git checkouts and contexts unused for 3 days; layers unused for 14 days (zot can restore them); cache mounts (sccache local level, pip) unused for 30 days; then a size backstop over every record at 75% and 80% of the disk, least recently used first. |
 | `[registry."<zot>"]` | `http = true` | zot is plain HTTP on the LAN. (`insecure = true` means HTTPS with an untrusted certificate, a different thing.) |
-| `[history]` | `maxAge = "720h"`, `maxEntries = 500` | Build records are the source for timing and hit rates (Section 4.8). Both must be set: a `[history]` section with one field missing treats it as zero. Default without the section is 48 h / 50 records. |
+| `[history]` | `maxAge = "336h"`, `maxEntries = 200` | Build records are the source for timing and hit rates (Section 4.8). Both must be set: a `[history]` section with one field missing treats it as zero. Default without the section is 48 h / 50 records. Records keep full step logs outside the build-cache GC, so both limits stay moderate. |
 | `[log]` | `format = "json"` | Step-log limits are the daemon env vars `BUILDKIT_STEP_LOG_MAX_SIZE` and `BUILDKIT_STEP_LOG_MAX_SPEED`, set to unlimited for verbose kernel compiles. |
 | `[grpc] debugAddress` | Optional, management network only | Exposes BuildKit's own `/metrics` to Prometheus. Unauthenticated, so firewalled. |
 
-One dependency to note: in BuildKit GC, each rule's size limit is compared with the **total** cache, not just the entries that rule matches. The local sccache level is therefore capped by sccache itself (`SCCACHE_CACHE_SIZE`), otherwise cache mounts growing past the layer threshold would make BuildKit evict every layer.
+One dependency to note: in BuildKit GC, each rule's size limit is compared with the **total** cache, but the rule deletes only the entries its filter matches. A size limit on the layer rule would therefore delete every layer whenever cache mounts alone pass that size. So the filtered rules expire by age only, size is handled by the backstop rules over every record, and the local sccache level is also capped by sccache itself (`SCCACHE_CACHE_SIZE`).
 
 ### 4.6 Multiple machines
 
@@ -191,8 +194,8 @@ One dependency to note: in BuildKit GC, each rule's size limit is compared with 
 
 - ROCm is never bundled into our wheels. For gfx942 the ROCm runtime is about 2.4 GiB, mostly hipBLASLt kernels, which is far larger than torch's own device code (about 51 MiB).
 - **Two flavours:**
-  - Depend on a pinned TheRock `rocm-sdk`.
-  - Assume a system ROCm already installed on the node.
+  - Depend on a pinned TheRock `rocm-sdk` (implemented): the torch wheel declares `rocm[libraries]==<ROCM_SDK_VERSION>` and its shared objects find the ROCm libraries next to torch through RPATH, as PyTorch's own TheRock wheels do.
+  - Assume a system ROCm already installed on the node (not implemented yet).
 - **Trims:**
   - Single arch.
   - `BUILD_TEST=0`.
@@ -200,8 +203,11 @@ One dependency to note: in BuildKit GC, each rule's size limit is compared with 
   - Strip Triton: 624 MiB of its 835 MiB `libtriton.so` is debug info. Also drop Triton's NVIDIA backend (92 MiB compressed); that needs a patch and has to be tested.
   - Keep torch headers, which AITER needs to JIT-compile.
 - **Separate wheels:**
-  - Our torch gets a unique local version, pinned exactly by both vLLM and LMCache.
-  - torch does not declare Triton; the shipped `constraints.txt` (exact versions of the tested environment) pins both, and `PIP_CONSTRAINT` protects them during the build.
+  - Our torch and torchvision get a unique local version (`+rpb.<gfx>`). vLLM's and LMCache's metadata are not edited; the shipped `constraints.txt` (exact versions of the tested environment) pins everything, and `PIP_CONSTRAINT` protects torch, Triton and torchvision during the build.
+  - torchvision is built from source against our torch: vLLM's requirements pull it in (through `timm`), and PyPI's build would be a CUDA one whose ops do not load against a ROCm torch.
+  - torch does not declare Triton; `constraints.txt` pins it.
+  - Only the torch and torchvision wheel names carry the gfx target; the other wheels have the same file name for every target and are kept apart by their output directory, `out/<gfx>/<package>/`.
+  - amdsmi, which vLLM uses to detect ROCm, is built from the sources TheRock ships in `rocm-sdk-core` and shipped next to `constraints.txt`.
   - LMCache's NVIDIA-only requirements (`cufile-python`, `nvtx`) are removed from its metadata.
 - **Expected download size for gfx942 (estimates):**
 
@@ -217,47 +223,46 @@ One dependency to note: in BuildKit GC, each rule's size limit is compared with 
 
 1. **BuildKit build history** (`docker buildx history`), one record per bake target:
    - Each target sets `BUILDKIT_BUILD_NAME` to `rpb/<target>/<gfx>/<run-id>`, so records name themselves.
-   - `bake --metadata-file` maps each target to its history ref. That file is written only when the bake succeeds, so `history ls --format json` is the fallback for failed runs.
+   - `history ls --format json` finds every record of the run by that name, including failed targets; `bake --metadata-file`, which lists only the targets that finished, adds their exact refs.
    - `history inspect <ref> --format json` gives the target's duration, error, build args, and total versus cached step counts.
-   - `history logs <ref> --progress=rawjson` replays every step with start, end and cached flag. Stage durations and a time-weighted hit rate come from this; `inspect` alone has only the whole-target duration.
+   - `history logs <ref> --progress=rawjson` replays every step with start, end and cached flag. Stage durations come from this; `inspect` alone has only the whole-target duration.
 2. **sccache stats** (`sccache --show-stats --stats-format=json`), captured in the same `RUN` step as the compile: hits, misses and errors per language and per cache level.
 3. **`.ninja_log`** from torch and vLLM, for the slowest translation units.
 
 **Two hit rates, reported separately, never merged:**
 
-- *Layer hit rate:* cached steps ÷ total steps from BuildKit. Every step counts the same, so a cached `COPY` weighs as much as a cached torch compile. The time-weighted version from the rawjson replay is reported next to it.
+- *Layer hit rate:* cached steps ÷ total steps from BuildKit. Every step counts the same, so a cached `COPY` weighs as much as a cached torch compile; the per-step durations in the record show which steps the hits saved.
 - *Compile hit rate:* from sccache. BuildKit cannot see it; when a layer misses but every compile hits Redis, only this number shows it.
 
 **Storage and display:**
 
 - One JSON record per run is the source of truth, with a `schema_version`, kept as an append-only results file.
-- On your machines: a `.prom` file written into the node-exporter textfile directory your AIC monitoring stack already reads, plus a Grafana dashboard alongside the AIC ones. Optionally, BuildKit's own `/metrics` and zot's metrics are scraped directly.
-- On EC2: a local Prometheus whose data is shipped with the results at teardown.
+- A `.prom` file per run slot written into the node-exporter textfile directory; `infra/monitoring/` runs node-exporter and a Prometheus that scrapes it and zot's metrics, and fits next to your AIC monitoring stack. A Grafana dashboard is planned.
 - No Pushgateway; its series never expire on their own.
 
 | Metric | Source |
 |---|---|
 | Target and stage wall time | `history inspect` and `history logs --progress=rawjson` |
-| Steps total / cached, time-weighted hit rate | BuildKit history |
-| sccache hits / misses / errors per language and level | sccache JSON stats |
-| Redis memory, evictions, hit ratio | Redis `INFO` |
+| Steps total / cached | BuildKit history |
+| sccache hits / misses / errors per language and level, and whether Redis was used | sccache JSON stats, `rpb-sccache-run` |
 | Slowest translation units | `.ninja_log` |
-| Registry bytes pulled and pushed | zot metrics |
-| CPU, RAM and disk saturation, peak RSS | node_exporter, `/usr/bin/time -v` |
+| Registry requests and storage | zot metrics |
+| CPU time and peak RSS per compile unit | `/usr/bin/time -v` |
 | Wheel sizes | export stage |
-| Critical path ÷ (CPU-seconds / cores) | derived |
+
+Planned, not collected yet: Valkey `INFO` (memory, evictions), CPU, RAM and disk saturation of the builders (node-exporter on the builders), BuildKit's `/metrics`, and the critical path ÷ (CPU-seconds / cores) ratio.
 
 ### 4.9 Benchmark method
 
-- **Five scripted wipe levels**, from "nothing cached" up to "everything cached". A run only counts if the reset is verified.
+- **Four scripted reset levels** (BuildKit state, the shared compile cache, zot, the page cache), combined per scenario. A run only counts if the reset is verified.
 - **Scenarios:**
   - Full cold.
-  - New machine with a warm shared cache.
+  - New machine with only the shared compile cache warm, and with only zot warm.
   - No-op rebuild.
-  - One-file vLLM patch.
-  - LMCache-only patch.
-  - torch version bump.
-- **Fairness:** AIC and this build run on the same instance type, gfx target and pins. The cold headline runs on 3 instances in parallel, each alternating the two builds in ABBA order. This follows the cloud-benchmarking literature: Laaber et al. (EMSE 2019) and the ATC 2023 "ordering trap" paper.
+  - One-file vLLM patch (Python only, and one HIP file).
+  - LMCache one-file patch.
+  - torch one-file patch.
+- **Fairness:** AIC and this build run on the same instance type, gfx target and pins, alternating in ABBA order (`bench/run-matrix.sh`). The cold headline is meant to run on 3 instances in parallel, one matrix per instance. This follows the cloud-benchmarking literature: Laaber et al. (EMSE 2019) and the ATC 2023 "ordering trap" paper.
 - **Statistics:**
   - One A/A run to measure the noise floor.
   - Raw points published along with the median and min–max.
@@ -281,18 +286,19 @@ GitHub-hosted runners have 4 vCPUs, 16 GB RAM and about 14 GB of free disk, so a
 
 | Tier | Trigger | Runner | What runs |
 |---|---|---|---|
-| T0 static | Every PR and push | GitHub-hosted | `bake --print` (parse and variable validation), `bake --list`, `bake --call check` (Dockerfile build checks), hadolint, shellcheck, actionlint, markdownlint, link check, and a pin check that each ref still resolves to its SHA |
-| T1 smoke | Every PR | GitHub-hosted | A tiny linked bake pair that exercises args, secrets, `target:` contexts and cache refs, in about 3 minutes |
-| T2 full build | Manual, nightly, or a maintainer's `/run-ci` comment | Your cluster: an ephemeral self-hosted runner, or a GitHub runner driving a remote builder over mTLS | `bake --jobs=defer-error all`, wheel export, cache push to zot, telemetry record, import test of the wheels |
+| T0 static | Every PR and push | GitHub-hosted | `bake --print` (parse and variable validation), `bake --list`, `bake --call check` (Dockerfile build checks), hadolint, shellcheck, actionlint, markdownlint, link check, spelling, telemetry tests, the `buildkitd.toml` and Prometheus config checks, and a pin check against the git hosts |
+| T1 smoke | Every PR and push | GitHub-hosted | A tiny linked bake pair that exercises args, `target:` contexts and the zot cache refs, in under a minute |
+| T1 mini-cluster | Every PR and push | GitHub-hosted | Two mTLS builders, zot, Valkey, node-exporter and Prometheus on one runner; 7 end-to-end checks (`docs/TESTING.md`) |
+| T2 full build | Manual or nightly | Your cluster: an ephemeral self-hosted runner, or a GitHub runner driving a remote builder over mTLS | `bake --jobs=defer-error all`, wheel export, cache push to zot, telemetry record, import test of the wheels |
 | T3 benchmark | Manual only | EC2, with a teardown step | The ABBA campaign of Section 4.9 |
 
 - T2 never runs on pull requests from forks. GitHub warns against self-hosted runners on public repositories, so the runner is ephemeral and the trigger is maintainer-only, the same pattern AIC uses.
 - **Documentation**, plain Markdown in `docs/`:
-  - `README.md`: what it is, a three-command quickstart, support matrix.
+  - `README.md`: what it is, a quickstart, requirements and supported GPU targets.
   - `docs/DESIGN.md`: this document.
   - `docs/OPERATIONS.md`: setting up builders, zot and Redis, certificates, teardown.
   - `docs/PINS.md`: how to bump a pin.
-  - `docs/TELEMETRY.md`, `docs/BENCHMARKING.md`, `docs/CI.md`.
+  - `docs/TELEMETRY.md`, `docs/BENCHMARKING.md`, `docs/CI.md`, and `docs/TESTING.md` (how to check every claim, and what is not proven yet).
   - `docs/adr/`: one short record per design decision.
   - `CONTRIBUTING.md` with DCO sign-off, `CODEOWNERS`, and a license matching AIC's MIT.
 
@@ -342,11 +348,11 @@ None of these need a GPU.
 ## 8. Milestones
 
 1. You review this document and answer the questions below.
-2. First commit: `docker-bake.hcl` skeleton, `buildkitd.toml`, CI tiers T0 and T1, docs layout.
-3. Run E1a, E1, E3, E4 and E6 locally or on one small instance.
-4. Build the stage graph and wheel exports for one gfx target.
-5. Add the telemetry harness and Grafana dashboard; enable T2 on your cluster.
-6. Run the EC2 benchmark campaign; publish raw data and a short report.
+2. Done on `dev`: the bake file, all Dockerfiles, `buildkitd.toml`, the cache node, the telemetry harness with Prometheus, CI tiers T0 and T1 (including the mini-cluster), and the docs.
+3. Next: the first full build on one x86 builder (with E1a, E1, E2, E5 and E6), then E3 and E4.
+4. Enable T2 on your cluster; add the Grafana dashboard.
+5. Run the EC2 benchmark campaign; publish raw data and a short report.
+6. Only then: merge `dev` into `main` and tag v1.0.0.
 
 ## 9. Questions still to be answered
 
@@ -358,6 +364,17 @@ None of these need a GPU.
 6. **Build machines and CI:** Cores, RAM and NVMe size per machine? Is a rootful, privileged `buildkitd` container with host networking acceptable? Can we have an ephemeral self-hosted runner, or a remote builder endpoint, on your cluster for the T2 full build? Could some benchmark runs use AMD machines?
 7. **Relationship to AIC:** Should this stay a standalone study, or should AIC consume these wheels?
 8. **Success targets:** Do the targets in Section 5 match what you want to show? Are spot instances acceptable for published numbers?
+
+## 10. Changes since v2
+
+- torchvision is built from source (Section 4.7), and torch-dev now holds torch, Triton and torchvision.
+- The torch wheel declares its ROCm dependency and sets RPATHs to TheRock's packages; amdsmi is built and shipped.
+- `GPU_ARCH` is limited to gfx90a, gfx942 and gfx950; every build is pinned to linux/amd64.
+- Site values move from an override file to environment variables, which keep validation.
+- GC rules expire by age, with size handled only by the backstop rules (Section 4.5); history limits are smaller.
+- zot gets 30-minute HTTP timeouts; cache refs include the ROCm and Python versions.
+- Redis fallbacks are recorded in every run record and in Prometheus; tests and benchmarks run in strict mode.
+- Telemetry: failed targets keep their records, compile units from cached layers are marked, and the time-weighted hit rate is dropped until it is implemented.
 
 ---
 
