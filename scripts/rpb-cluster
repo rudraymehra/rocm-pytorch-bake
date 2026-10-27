@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Build everything across several remote builders.
+#
+#   scripts/rpb-cluster --builders "rpb-build1 rpb-build2 rpb-build3" --registry zot.lan:5000 \
+#                       [--scenario nightly] [-- <extra docker buildx bake args>]
+#
+#   Phase A  first builder: torch-wheel, triton-wheel and torch-dev; torch-dev is
+#            pushed to zot and its digest recorded.
+#   Phase B  downstream wheels in parallel, each on the builder that built it last
+#            (sticky routes in .rpb-routes), all from torch-dev@digest.
+#   Phase C  first builder: install-and-test of every wheel from the local outputs.
+# Each phase is an ordinary scripts/rpb run with its own results/<run_id>/.
+set -euo pipefail
+
+repo=$(cd "$(dirname "$0")/.." && pwd)
+cd "$repo"
+usage() { sed -n '2,12p' "$0" >&2; exit 2; }
+
+builders="" registry="" scenario="dev"
+extra=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --builders) builders=$2; shift 2 ;;
+        --registry) registry=$2; shift 2 ;;
+        --scenario) scenario=$2; shift 2 ;;
+        --) shift; extra=("$@"); break ;;
+        *) usage ;;
+    esac
+done
+[ -n "$builders" ] && [ -n "$registry" ] || usage
+read -r -a bl <<< "$builders"
+first=${bl[0]}
+group="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD)"
+common=(--var "CACHE_REGISTRY=$registry" ${extra[@]+"${extra[@]}"})
+
+# Phase A
+scripts/rpb build --builder "$first" --scenario "$scenario" --targets "torch-wheel triton-wheel torch-dev" -- \
+    "${common[@]}" --set "torch-dev.output=type=image,name=$registry/rpb/torch-dev:$group,push=true"
+meta=$(printf '%s\n' results/*/bake-metadata.json | sort | tail -1)
+digest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["torch-dev"]["containerimage.digest"])' "$meta")
+torch_dev="$registry/rpb/torch-dev@$digest"
+echo "torch-dev: $torch_dev"
+
+# Phase B: sticky routes; a target without a route goes to the builder with the fewest targets.
+routes=.rpb-routes
+touch "$routes"
+n=${#bl[@]}
+load=() assign=()
+for i in $(seq 0 $((n - 1))); do load[i]=0; assign[i]=""; done
+for t in aiter-wheel fa-wheel lmcache-wheel vllm-wheel; do
+    want=$(awk -v t="$t" '$1 == t {print $2}' "$routes")
+    pick=-1
+    for i in $(seq 0 $((n - 1))); do [ "${bl[i]}" = "$want" ] && pick=$i; done
+    if [ "$pick" -lt 0 ]; then
+        pick=0
+        for i in $(seq 1 $((n - 1))); do [ "${load[i]}" -lt "${load[pick]}" ] && pick=$i; done
+    fi
+    assign[pick]="${assign[pick]} $t"
+    load[pick]=$((load[pick] + 1))
+done
+: > "$routes"
+pids=()
+for i in $(seq 0 $((n - 1))); do
+    [ -n "${assign[i]}" ] || continue
+    b=${bl[i]}
+    for t in ${assign[i]}; do echo "$t $b" >> "$routes"; done
+    echo "phase B: $b <-${assign[i]}"
+    scripts/rpb build --builder "$b" --scenario "$scenario" --targets "${assign[i]# }" -- \
+        "${common[@]}" --var "TORCH_DEV_IMAGE=$torch_dev" > "results/.phase-b-$b.log" 2>&1 &
+    pids+=($!)
+done
+status=0
+for p in "${pids[@]}"; do wait "$p" || status=1; done
+if [ "$status" -ne 0 ]; then
+    echo "a downstream build failed; see results/.phase-b-*.log" >&2
+    exit 1
+fi
+
+# Phase C: test against the wheels already exported to out/
+gfx=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["GPU_ARCH"])' "$(dirname "$meta")/pins.json")
+sets=()
+for pair in torch-wheel:torch triton-wheel:triton aiter-wheel:aiter fa-wheel:fa lmcache-wheel:lmcache vllm-wheel:vllm; do
+    sets+=(--set "test.contexts.${pair%%:*}=out/$gfx/${pair#*:}")
+done
+scripts/rpb build --builder "$first" --scenario "$scenario" --targets test -- "${common[@]}" "${sets[@]}"
+echo "cluster build $group done"

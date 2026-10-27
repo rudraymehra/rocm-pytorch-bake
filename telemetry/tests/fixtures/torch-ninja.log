@@ -1,0 +1,5 @@
+# ninja log v5
+0	1000	0	foo.o	abc
+0	500	0	bar.o	def
+1000	9000	0	attention.hip.o	ghi
+2000	2500	0	bar.o	def

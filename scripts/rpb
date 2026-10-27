@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Run one bake on one builder and record everything about it in results/<run_id>/.
+#
+#   scripts/rpb build --builder rpb-build1 [--scenario C0] [--config rpb] [--host-class m7a.16xlarge]
+#                     [--targets "wheels test"] [-- <extra docker buildx bake args>]
+#
+# Environment: RPB_TEXTFILE_DIR (optional) = node-exporter textfile directory to update.
+# Exit status is the bake's exit status; telemetry is collected either way.
+set -euo pipefail
+
+repo=$(cd "$(dirname "$0")/.." && pwd)
+cd "$repo"
+
+usage() { sed -n '2,8p' "$0" >&2; exit 2; }
+
+[ "${1:-}" = "build" ] || usage
+shift
+builder="" scenario="dev" config="rpb" host_class="${RPB_HOST_CLASS:-local}" targets="wheels test"
+extra=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --builder) builder=$2; shift 2 ;;
+        --scenario) scenario=$2; shift 2 ;;
+        --config) config=$2; shift 2 ;;
+        --host-class) host_class=$2; shift 2 ;;
+        --targets) targets=$2; shift 2 ;;
+        --) shift; extra=("$@"); break ;;
+        *) usage ;;
+    esac
+done
+[ -n "$builder" ] || usage
+
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD)"
+res="results/$run_id"
+mkdir -p "$res/inspect" "$res/steps" "$res/telemetry"
+read -r -a target_list <<< "$targets"
+
+docker buildx bake --builder "$builder" --var "RUN_ID=$run_id" ${extra[@]+"${extra[@]}"} --print "${target_list[@]}" \
+    > "$res/bake-print.json" 2>/dev/null
+gpu_arch=$(python3 -c 'import json,sys; t=json.load(open(sys.argv[1]))["target"]; print(next(iter(t.values()))["args"]["GPU_ARCH"])' "$res/bake-print.json")
+python3 -m telemetry.runmeta pins "$res/bake-print.json" > "$res/pins.json"
+# Only this run's own output directories are cleared, so parallel runs on other
+# builders (scripts/rpb-cluster) do not delete each other's wheels.
+outputs=()
+while IFS= read -r dest; do outputs+=("$dest"); done < <(python3 -m telemetry.runmeta outputs "$res/bake-print.json")
+for dest in ${outputs[@]+"${outputs[@]}"}; do rm -rf "$dest"; done
+
+now() { python3 -c "import time; print(time.time())"; }
+t_start=$(now)
+status=0
+docker buildx bake --builder "$builder" --jobs defer-error \
+    --var "RUN_ID=$run_id" --metadata-file "$res/bake-metadata.json" --progress plain \
+    ${extra[@]+"${extra[@]}"} "${target_list[@]}" 2>&1 | tee "$res/bake.log" || status=$?
+t_end=$(now)
+
+# Map each target to its BuildKit history record. The metadata file only exists
+# when the bake finished; otherwise history ls finds the records by name.
+docker buildx history ls --builder "$builder" --format json --no-trunc --filter "startedAt>24h" \
+    > "$res/history-ls.json" 2>/dev/null || true
+python3 -m telemetry.runmeta refs "$res/bake-metadata.json" "$res/history-ls.json" "$run_id" > "$res/refs.tsv"
+while IFS=$'\t' read -r target ref; do
+    docker buildx history inspect --builder "$builder" "$ref" --format json > "$res/inspect/$target.json"
+    docker buildx history logs --builder "$builder" --progress=rawjson "$ref" 2> "$res/steps/$target.jsonl" >/dev/null || true
+done < "$res/refs.tsv"
+
+existing=()
+for dest in ${outputs[@]+"${outputs[@]}"}; do
+    [ -d "$dest" ] || continue
+    existing+=("$dest")
+    if [ -d "$dest/telemetry" ]; then
+        cp "$dest"/telemetry/* "$res/telemetry/" 2>/dev/null || true
+    fi
+done
+if [ "${#existing[@]}" -gt 0 ]; then
+    python3 -m telemetry.runmeta wheels "${existing[@]}" > "$res/wheels.json"
+fi
+
+python3 - "$res" "$run_id" "$scenario" "$config" "$host_class" "$gpu_arch" "$t_start" "$t_end" "$status" "$builder" <<'EOF'
+import json, os, platform, subprocess, sys
+res, run_id, scenario, config, host_class, gpu, t0, t1, status, builder = sys.argv[1:]
+def out(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
+    except Exception:
+        return None
+meta = {
+    "run_id": run_id, "scenario": scenario, "config": config, "host_class": host_class,
+    "gpu_arch": gpu, "t_start": float(t0), "t_end": float(t1),
+    "status": "ok" if status == "0" else "failed", "exit_code": int(status),
+    "builder": builder, "repo_commit": out("git", "rev-parse", "HEAD"),
+    "buildx_version": out("docker", "buildx", "version"),
+    "client_host": platform.node(),
+    "pins": json.load(open(os.path.join(res, "pins.json"))),
+}
+json.dump(meta, open(os.path.join(res, "meta.json"), "w"), indent=2, sort_keys=True)
+EOF
+
+python3 -m telemetry.collect "$res"
+if [ -n "${RPB_TEXTFILE_DIR:-}" ]; then
+    python3 -m telemetry.prom "$res/record.json" "$RPB_TEXTFILE_DIR/rpb.prom"
+fi
+echo "run $run_id: status $status, results in $res"
+exit "$status"

@@ -1,0 +1,7 @@
+	Command being timed: "python3 -m pip wheel ."
+	User time (seconds): 50000.50
+	System time (seconds): 1200.25
+	Percent of CPU this job got: 2600%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 32:21.50
+	Maximum resident set size (kbytes): 4096
+	Exit status: 0
