@@ -1,0 +1,8 @@
+config:
+  MD013: false     # long lines are fine in prose and tables
+  MD033: false     # inline HTML allowed (details blocks)
+  MD060: false     # compact |---| table delimiter rows are fine
+ignores:
+  - .github/**
+  - results/**
+  - out/**

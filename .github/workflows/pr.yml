@@ -1,0 +1,126 @@
+# Tier T0 (static checks) and T1 (smoke build) on GitHub-hosted runners.
+# Nothing here builds PyTorch: a runner has 4 vCPU, 16 GB RAM and ~14 GB of disk.
+name: pr
+
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.38.1
+
+      - name: Bake file parses and every variable validates
+        run: |
+          docker buildx bake --print all > /dev/null
+          docker buildx bake --list=targets
+          docker buildx bake --list=variables
+
+      - name: Dockerfile build checks (BuildKit lint, no build)
+        run: docker buildx bake lint
+
+      - uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: "docker/*.Dockerfile"
+          recursive: true
+          config: .hadolint.yaml
+
+      - name: shellcheck
+        run: shellcheck scripts/rpb scripts/rpb-cluster scripts/rpb-sccache-run scripts/rpb-check-offload-arch infra/*/*.sh bench/*.sh dev/minicluster/run.sh
+
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
+
+      - uses: DavidAnson/markdownlint-cli2-action@696eb3f2509270d7b882d2aa68347bc676e7af34 # v25.0.0
+        with:
+          globs: "**/*.md"
+
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: --no-progress --max-retries 3 "./**/*.md"
+          fail: true
+
+      - uses: crate-ci/typos@7f9d0819ca1c008ade73f4b41fa9d258d48f605b # v1.51.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Telemetry unit tests
+        run: |
+          python -m pip install pytest==9.1.1
+          python -m pytest -q telemetry/tests
+
+      - name: Pins resolve to the pinned commits
+        run: python scripts/check-pins
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tools/check-buildkitd-config/go.mod
+          cache-dependency-path: tools/check-buildkitd-config/go.sum
+
+      - name: buildkitd.toml has no unknown keys
+        working-directory: tools/check-buildkitd-config
+        run: go run . ../../infra/buildkit/buildkitd.toml
+
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Start zot with the production config
+        run: |
+          docker run -d --name zot -p 5000:5000 \
+            -v "$PWD/infra/cache-node/zot-config.json:/etc/zot/config.json:ro" \
+            ghcr.io/project-zot/zot:v2.1.22@sha256:96cda11459ce6f8c60da3b03f03e9f67fd11b3ae2d82c4c04c92b3c608996080
+          for _ in $(seq 1 30); do curl -fsS http://localhost:5000/v2/ && break; sleep 1; done
+          curl -fsS http://localhost:5000/v2/
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.38.1
+          driver-opts: network=host
+          buildkitd-config-inline: |
+            [registry."localhost:5000"]
+              http = true
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Linked targets build and export cache to zot
+        run: docker buildx bake --var CACHE_REGISTRY=localhost:5000 smoke
+
+      - name: An empty builder reuses the layers from zot
+        run: |
+          docker buildx prune -af
+          docker buildx bake --var CACHE_REGISTRY=localhost:5000 --metadata-file meta.json smoke
+          python -m telemetry.runmeta refs meta.json /dev/null unused > refs.tsv
+          cat refs.tsv
+          total=0
+          while IFS=$'\t' read -r target ref; do
+            n=$(docker buildx history inspect "$ref" --format json | python -c 'import json,sys; print(json.load(sys.stdin)["NumCachedSteps"])')
+            echo "$target cached steps: $n"
+            total=$((total + n))
+          done < refs.tsv
+          test "$total" -gt 0

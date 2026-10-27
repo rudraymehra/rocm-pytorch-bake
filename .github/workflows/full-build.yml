@@ -1,0 +1,52 @@
+# Tier T2: the full build on a self-hosted builder. Never runs for pull requests:
+# a public repository must not run untrusted code on self-hosted machines.
+# Enabled only when the repository variable RPB_SELF_HOSTED is "true".
+name: full-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: Scenario code recorded in the telemetry (for example C0, W0, nightly)
+        default: manual
+        required: true
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: vars.RPB_SELF_HOSTED == 'true'
+    runs-on: [self-hosted, linux, x64, rpb-builder]
+    timeout-minutes: 300
+    environment: self-hosted
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build everything and record telemetry
+        env:
+          SCENARIO: ${{ github.event_name == 'schedule' && 'nightly' || inputs.scenario }}
+          BUILDER: ${{ vars.RPB_BUILDER }}
+          RPB_HOST_CLASS: ${{ vars.RPB_HOST_CLASS }}
+          RPB_TEXTFILE_DIR: ${{ vars.RPB_TEXTFILE_DIR }}
+          CACHE_REGISTRY: ${{ vars.RPB_CACHE_REGISTRY }}
+          SCCACHE_ENV_FILE: ${{ vars.RPB_SCCACHE_ENV_FILE }}
+        run: |
+          scripts/rpb build --builder "$BUILDER" --scenario "$SCENARIO" --targets "wheels test" -- \
+            --var "CACHE_REGISTRY=$CACHE_REGISTRY" --var "SCCACHE_ENV_FILE=$SCCACHE_ENV_FILE"
+
+      - name: Keep the run record
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-${{ github.run_id }}
+          path: results/
+          retention-days: 90

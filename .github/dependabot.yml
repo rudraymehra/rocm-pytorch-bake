@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /tools/check-buildkitd-config
+    target-branch: dev
+    schedule:
+      interval: weekly
