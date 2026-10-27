@@ -90,3 +90,13 @@ def test_parse_time_v():
 def test_parse_ninja_log_skips_a_truncated_last_line():
     text = "# ninja log v5\n0\t1500\t0\ta.o\tdeadbeef\n2000\t25"
     assert collect.parse_ninja_log(text)["edges"] == 1
+
+
+@pytest.mark.parametrize("value, micro", [
+    ("2026-10-27T14:53:41Z", 0),
+    ("2026-10-27T14:53:41.5Z", 500000),
+    ("2026-10-27T14:53:41.123+00:00", 123000),
+    ("2026-10-27T14:53:41.324758833Z", 324758),
+])
+def test_timestamps_parse_with_any_number_of_fractional_digits(value, micro):
+    assert collect._ts(value).microsecond == micro

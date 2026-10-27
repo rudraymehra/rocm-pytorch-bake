@@ -44,13 +44,14 @@ def parse_inspect(obj: dict) -> dict:
     }
 
 
-_FRACTION = re.compile(r"(\.\d{6})\d+")
+_FRACTION = re.compile(r"\.(\d+)")
 
 
 def _ts(value: str) -> datetime:
-    # BuildKit writes nanoseconds; datetime.fromisoformat before Python 3.11 accepts
-    # at most 6 fractional digits (Ubuntu 22.04 ships 3.10).
-    return datetime.fromisoformat(_FRACTION.sub(r"\1", value.replace("Z", "+00:00")))
+    # BuildKit writes up to 9 fractional digits; datetime.fromisoformat before Python
+    # 3.11 accepts exactly 3 or 6 (Ubuntu 22.04 ships 3.10), so use exactly 6.
+    value = value.replace("Z", "+00:00")
+    return datetime.fromisoformat(_FRACTION.sub(lambda m: "." + m.group(1)[:6].ljust(6, "0"), value, count=1))
 
 
 def parse_rawjson(lines: list[str]) -> list[dict]:
