@@ -16,9 +16,11 @@ def make_run(tmp_path: Path) -> Path:
     shutil.copy(FIX / "steps-torch-wheel.jsonl", run / "steps" / "torch-wheel.jsonl")
     for name in ("torch-sccache.json", "torch-time.txt", "torch-ninja.log"):
         shutil.copy(FIX / name, run / "telemetry" / name)
+    (run / "telemetry" / "torch-sccache-remote.txt").write_text("redis\n")
     (run / "meta.json").write_text(json.dumps({
         "run_id": "run1", "scenario": "C0", "config": "rpb", "host_class": "m7a.16xlarge",
         "gpu_arch": "gfx942", "t_start": 1000.0, "t_end": 3000.0, "status": "ok",
+        "builder": "rpb-build1", "target_set": "torch-wheel",
         "pins": {"torch": "v2.13.0", "vllm": "e8ae84bf"},
     }))
     (run / "wheels.json").write_text(json.dumps({"torch-2.13.0+rpb.gfx942-cp312-cp312-linux_x86_64.whl": 123}))
@@ -35,6 +37,7 @@ def test_build_record_joins_all_sources(tmp_path):
     assert unit["sccache"]["hits"]["HIP"] == 250
     assert unit["time"]["peak_rss_bytes"] == 4096 * 1024
     assert unit["ninja"]["longest"][0]["output"] == "attention.hip.o"
+    assert unit["remote"] == "redis"
 
 
 def test_main_writes_record_atomically(tmp_path):
@@ -44,7 +47,8 @@ def test_main_writes_record_atomically(tmp_path):
     assert not (run / "record.json.tmp").exists()
 
 
-COMMON = {"config": "rpb", "gpu_arch": "gfx942", "host_class": "m7a.16xlarge", "scenario": "C0"}
+COMMON = {"builder": "rpb-build1", "config": "rpb", "gpu_arch": "gfx942", "host_class": "m7a.16xlarge",
+          "scenario": "C0", "target_set": "torch-wheel"}
 
 
 def series(name, value, **labels):
@@ -62,6 +66,7 @@ def test_prom_output_has_expected_series(tmp_path):
     assert series("rpb_buildkit_cached_ratio", 0.75, target="torch-wheel") in lines
     assert series("rpb_sccache_compiles", 250, unit="torch", lang="HIP", result="hit") in lines
     assert series("rpb_peak_rss_bytes", 4194304, unit="torch") in lines
+    assert series("rpb_sccache_remote", 1, unit="torch", state="redis") in lines
     assert series("rpb_wheel_size_bytes", 123, package="torch") in lines
     assert series("rpb_run_success", 1) in lines
     assert any(l.startswith("rpb_run_info{") and 'run_id="run1"' in l for l in lines)
@@ -82,3 +87,34 @@ def test_write_textfile_is_atomic(tmp_path):
     prom.write_textfile("x 1\n", target)
     assert target.read_text() == "x 1\n"
     assert [p.name for p in tmp_path.iterdir()] == ["rpb.prom"]
+
+
+def test_slots_get_their_own_file_and_never_share_a_series(tmp_path):
+    # scripts/rpb-cluster: phase A and phase C run on the same builder and scenario.
+    rec_a = collect.build_record(make_run(tmp_path))
+    rec_c = {**rec_a, "target_set": "test", "targets": {}, "compile_units": {}, "wheels": {}}
+    assert prom.textfile_name(rec_a) == "rpb_C0_rpb-build1_torch-wheel.prom"
+    assert prom.textfile_name({**rec_a, "target_set": "aiter-wheel,fa-wheel"}) == "rpb_C0_rpb-build1_aiter-wheel_fa-wheel.prom"
+    assert prom.textfile_name(rec_a) != prom.textfile_name(rec_c)
+
+    def samples(rec):
+        return {l.rsplit(" ", 1)[0] for l in prom.render(rec).splitlines() if l and not l.startswith("#")}
+
+    assert not samples(rec_a) & samples(rec_c)
+
+
+def test_main_writes_into_the_textfile_dir(tmp_path):
+    run = make_run(tmp_path)
+    collect.main(["collect", str(run)])
+    out = tmp_path / "textfile"
+    out.mkdir()
+    assert prom.main(["prom", str(run / "record.json"), str(out)]) == 0
+    assert [p.name for p in out.iterdir()] == ["rpb_C0_rpb-build1_torch-wheel.prom"]
+
+
+def test_missing_remote_file_is_reported_as_unknown(tmp_path):
+    run = make_run(tmp_path)
+    (run / "telemetry" / "torch-sccache-remote.txt").unlink()
+    rec = collect.build_record(run)
+    assert rec["compile_units"]["torch"]["remote"] is None
+    assert series("rpb_sccache_remote", 1, unit="torch", state="unknown") in prom.render(rec).splitlines()

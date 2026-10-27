@@ -1,0 +1,78 @@
+{
+  "Name": "rpb/toy/gfx942/20261027T145340Z-23aa160-rpb-localhost-12341",
+  "Ref": "h4fg1wkfk9cwynphgdek4pom3",
+  "Context": ".",
+  "Dockerfile": "dev/minicluster/toy.Dockerfile",
+  "VCSRepository": "git@github.com:rudraymehra/rocm-pytorch-bake.git",
+  "VCSRevision": "23aa160d2f66e0efd27ccc92018e4a74832ead7b",
+  "Target": "export",
+  "StartedAt": "2026-10-27T20:23:41.19920575+05:30",
+  "CompletedAt": "2026-10-27T20:23:48.87011292+05:30",
+  "Duration": 7670907170,
+  "Status": "completed",
+  "NumCompletedSteps": 20,
+  "NumTotalSteps": 20,
+  "NumCachedSteps": 6,
+  "BuildArgs": [
+    {
+      "Name": "BUILDKIT_BUILD_NAME",
+      "Value": "rpb/toy/gfx942/20261027T145340Z-23aa160-rpb-localhost-12341"
+    },
+    {
+      "Name": "CACHE_PROBE",
+      "Value": "1793112683"
+    },
+    {
+      "Name": "GPU_ARCH",
+      "Value": "gfx942"
+    },
+    {
+      "Name": "PYTHON_VERSION",
+      "Value": "3.12"
+    },
+    {
+      "Name": "ROCM_SDK_VERSION",
+      "Value": "10.0.0"
+    }
+  ],
+  "Config": {
+    "RestRaw": [
+      {
+        "Name": "cache-imports",
+        "Value": "[{\"Type\":\"registry\",\"Attrs\":{\"ref\":\"zot:5000/rpb/cache:toy-gfx942\"}},{\"Type\":\"registry\",\"Attrs\":{\"ref\":\"zot:5000/rpb/cache:toy-gfx942-ref\"}}]"
+      }
+    ]
+  },
+  "Materials": [
+    {
+      "URI": "pkg:docker/docker/dockerfile@1.28?digest=sha256:bb22d9815c728170f72750f4e5b0d672e06176142e1d602c7e66c050100b7e5b\u0026platform=linux%2Farm64",
+      "Digests": [
+        "sha256:bb22d9815c728170f72750f4e5b0d672e06176142e1d602c7e66c050100b7e5b"
+      ]
+    },
+    {
+      "URI": "pkg:docker/docker/dockerfile@1.28?digest=sha256:bb22d9815c728170f72750f4e5b0d672e06176142e1d602c7e66c050100b7e5b",
+      "Digests": [
+        "sha256:bb22d9815c728170f72750f4e5b0d672e06176142e1d602c7e66c050100b7e5b"
+      ]
+    },
+    {
+      "URI": "pkg:docker/debian@bookworm-slim?digest=sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8\u0026platform=linux%2Farm64",
+      "Digests": [
+        "sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8"
+      ]
+    },
+    {
+      "URI": "https://github.com/mozilla/sccache/releases/download/v0.19.0/sccache-v0.19.0-aarch64-unknown-linux-musl.tar.gz",
+      "Digests": [
+        "sha256:3e47fc4a71b1ddd1b4294a0de9d34498922fdf41e3cd0bda5df3954e3d6deb9d"
+      ]
+    }
+  ],
+  "Attachments": [
+    {
+      "Digest": "sha256:c8c6146ffc6b9bfbd8556495ce83ed2602f6b8db64622af071c0a16bbe4e89d2",
+      "Type": "https://slsa.dev/provenance/v1"
+    }
+  ]
+}

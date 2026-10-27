@@ -175,6 +175,9 @@ def build_record(run_dir: Path) -> dict:
     for f in sorted(tel.glob("*-sccache.json")) if tel.exists() else []:
         name = f.name[: -len("-sccache.json")]
         unit = {"sccache": parse_sccache(json.loads(f.read_text()))}
+        remote = tel / f"{name}-sccache-remote.txt"
+        # redis | none | fallback, written by rpb-sccache-run; None for older runs
+        unit["remote"] = remote.read_text().strip() if remote.exists() else None
         time_file = tel / f"{name}-time.txt"
         if time_file.exists():
             unit["time"] = parse_time_v(time_file.read_text())

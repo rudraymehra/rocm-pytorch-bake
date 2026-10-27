@@ -1,9 +1,13 @@
 """Render a record.json as Prometheus text for the node-exporter textfile collector.
 
-All values are gauges describing the latest finished run for a (scenario, config,
-host_class, gpu_arch) combination. run_id and pins appear only on rpb_run_info.
+All values are gauges describing the latest finished run of one slot: a scenario,
+builder and set of targets. Each slot has its own file, so the phases of
+scripts/rpb-cluster do not overwrite each other, and the builder and target_set
+labels keep the series of different files apart (node-exporter rejects duplicates).
+run_id and pins appear only on rpb_run_info.
 
-Usage: python3 -m telemetry.prom results/<run_id>/record.json /var/lib/node_exporter/textfile/rpb.prom
+Usage: python3 -m telemetry.prom results/<run_id>/record.json <textfile-dir>
+       writes <textfile-dir>/rpb_<scenario>_<builder>_<targets>.prom
 """
 
 from __future__ import annotations
@@ -25,13 +29,14 @@ HELP = {
     "rpb_buildkit_cached_ratio": "Cached steps divided by total steps (unweighted).",
     "rpb_sccache_compiles": "sccache compile results inside one compile unit.",
     "rpb_sccache_hit_ratio": "sccache hits / (hits + misses) per language.",
+    "rpb_sccache_remote": "1 for the state of the shared Redis level: redis, none or fallback.",
     "rpb_cpu_seconds": "CPU time of one compile unit, by mode.",
     "rpb_peak_rss_bytes": "Largest resident set of any process in one compile unit.",
     "rpb_ninja_longest_edge_seconds": "Longest single ninja edge in one compile unit.",
     "rpb_wheel_size_bytes": "Size of an exported wheel.",
 }
 
-COMMON = ("config", "gpu_arch", "host_class", "scenario")
+COMMON = ("builder", "config", "gpu_arch", "host_class", "scenario", "target_set")
 
 
 def _label_value(v) -> str:
@@ -88,6 +93,7 @@ def render(rec: dict) -> str:
             o.add("rpb_sccache_compiles", sc["misses"].get(lang, 0), unit=unit, lang=lang, result="miss")
             o.add("rpb_sccache_hit_ratio", sc["hit_ratio"].get(lang), unit=unit, lang=lang)
         o.add("rpb_sccache_compiles", sc["cache_errors"], unit=unit, lang="all", result="error")
+        o.add("rpb_sccache_remote", 1, unit=unit, state=u.get("remote") or "unknown")
         tm = u.get("time") or {}
         o.add("rpb_cpu_seconds", tm.get("user_s"), unit=unit, mode="user")
         o.add("rpb_cpu_seconds", tm.get("system_s"), unit=unit, mode="system")
@@ -111,12 +117,17 @@ def write_textfile(text: str, target: Path) -> None:
     os.replace(tmp, target)
 
 
+def textfile_name(rec: dict) -> str:
+    slot = "_".join(str(rec.get(k, "")) for k in ("scenario", "builder", "target_set"))
+    return "rpb_" + re.sub(r"[^A-Za-z0-9.-]+", "_", slot).strip("_") + ".prom"
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 3:
-        print("usage: python3 -m telemetry.prom <record.json> <out.prom>", file=sys.stderr)
+        print("usage: python3 -m telemetry.prom <record.json> <textfile-dir>", file=sys.stderr)
         return 2
     rec = json.loads(Path(argv[1]).read_text())
-    write_textfile(render(rec), Path(argv[2]))
+    write_textfile(render(rec), Path(argv[2]) / textfile_name(rec))
     return 0
 
 

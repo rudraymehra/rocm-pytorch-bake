@@ -3,10 +3,15 @@
 #
 #   rpb-sccache-run <name> -- <command> [args...]
 #
-# Writes /out/telemetry/<name>-sccache.json and /out/telemetry/<name>-time.txt.
+# Writes /out/telemetry/<name>-sccache.json, <name>-time.txt and <name>-sccache-remote.txt.
 # If the BuildKit secret "sccache_env" is mounted, it is sourced first; it turns on
 # the shared Redis level (SCCACHE_MULTILEVEL_CHAIN=disk,redis plus credentials).
-# If that level is unreachable, the build continues with the local disk level only.
+# If that level is unreachable, the build continues with the local disk level only,
+# unless the secret sets RPB_SCCACHE_REQUIRE_REMOTE=1 (tests and benchmarks), which
+# fails the step instead. <name>-sccache-remote.txt records which case happened:
+#   redis     the shared level was used
+#   none      no shared level was configured (no secret)
+#   fallback  a shared level was configured but unreachable; local disk only
 set -euo pipefail
 
 if [ "$#" -lt 3 ] || [ "$2" != "--" ]; then
@@ -32,13 +37,23 @@ fi
 # filesystem keeps each server private.
 export SCCACHE_SERVER_UDS=/tmp/rpb-sccache-${name}.sock
 
+remote=none
+if [ -n "${SCCACHE_MULTILEVEL_CHAIN:-}" ]; then
+    remote=redis
+fi
 if ! sccache --start-server; then
+    if [ "$remote" = redis ] && [ "${RPB_SCCACHE_REQUIRE_REMOTE:-0}" = 1 ]; then
+        echo "rpb-sccache-run: shared cache level unavailable and RPB_SCCACHE_REQUIRE_REMOTE=1; failing" >&2
+        exit 1
+    fi
     echo "rpb-sccache-run: shared cache level unavailable; continuing with the local disk level only" >&2
+    remote=fallback
     unset SCCACHE_MULTILEVEL_CHAIN SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY \
           SCCACHE_REDIS_ENDPOINT SCCACHE_REDIS_USERNAME SCCACHE_REDIS_PASSWORD \
           SCCACHE_REDIS_KEY_PREFIX
     sccache --start-server
 fi
+echo "$remote" > "$telemetry_dir/${name}-sccache-remote.txt"
 sccache --zero-stats >/dev/null
 
 status=0
