@@ -1,0 +1,41 @@
+# Dev mini-cluster for a laptop with Docker Desktop: two remote BuildKit builders,
+# zot and Valkey, wired exactly like the real cluster (mTLS, plain-HTTP zot,
+# Redis-backed sccache). Driven by dev/minicluster/run.sh; never used in production.
+name: rpb-mini
+
+services:
+  zot:
+    image: ghcr.io/project-zot/zot:v2.1.22@sha256:96cda11459ce6f8c60da3b03f03e9f67fd11b3ae2d82c4c04c92b3c608996080
+    command: ["serve", "/etc/zot/config.json"]
+    volumes:
+      - ../../infra/cache-node/zot-config.json:/etc/zot/config.json:ro
+      - zot-data:/var/lib/registry
+
+  valkey:
+    image: valkey/valkey:9.1.2@sha256:418652cfb58ef879d4978c33553735d7147016032d5aefaa14c828e611eb9dfd
+    command: ["valkey-server", "/etc/valkey/valkey.conf"]
+    volumes:
+      - ./.state/valkey:/etc/valkey:ro
+
+  builder1: &builder
+    image: moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+    privileged: true
+    command: ["--config", "/etc/buildkit/buildkitd.toml"]
+    environment:
+      BUILDKIT_STEP_LOG_MAX_SIZE: "-1"
+    ports: ["127.0.0.1:12341:1234"]
+    volumes:
+      - ./.state/buildkit:/etc/buildkit:ro
+      - builder1-state:/var/lib/buildkit
+
+  builder2:
+    <<: *builder
+    ports: ["127.0.0.1:12342:1234"]
+    volumes:
+      - ./.state/buildkit:/etc/buildkit:ro
+      - builder2-state:/var/lib/buildkit
+
+volumes:
+  zot-data:
+  builder1-state:
+  builder2-state:

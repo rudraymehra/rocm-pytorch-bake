@@ -1,0 +1,9 @@
+--- a/vllm/logger.py	2026-10-27 16:01:10
++++ b/vllm/logger.py	2026-10-27 16:01:10
+@@ -422,3 +422,6 @@
+         # by default, this is the vllm root directory
+         root_dir = os.path.dirname(os.path.dirname(__file__))
+     sys.settrace(partial(_trace_calls, log_file_path, root_dir))
++
++def _rpb_w1a_marker() -> int:
++    return 1

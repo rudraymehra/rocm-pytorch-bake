@@ -1,0 +1,8 @@
+--- a/csrc/mem_kernels.cu	2026-10-27 16:01:13
++++ b/csrc/mem_kernels.cu	2026-10-27 16:01:13
+@@ -1371,3 +1371,5 @@
+     offset += max_nbytes;
+   }
+ }
++
++int rpb_w2_marker() { return 1; }
