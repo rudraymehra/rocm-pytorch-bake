@@ -343,6 +343,12 @@ target "pytorch-wheel" {
   target     = "wheel"
   dockerfile = "Dockerfile.pytorch"
 
+  # Merged into the args inherited from pytorch, so the wheel's history
+  # record is told apart from the image's.
+  args = {
+    BUILDKIT_BUILD_NAME = "rpb/torch-wheel/${PYTORCH_ROCM_ARCH}/${RUN_ID}"
+  }
+
   tags = compact([
     "${REGISTRY}/${REGISTRY_NAME}/pytorch-wheel:${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}",
     "${REGISTRY}/${REGISTRY_NAME}/pytorch-wheel:latest",
@@ -385,7 +391,6 @@ target "triton-wheel" {
 
   args = {
     BUILDKIT_BUILD_NAME = "rpb/triton-wheel/${PYTORCH_ROCM_ARCH}/${RUN_ID}"
-    BUILDKIT_BUILD_NAME = "rpb/torch-wheel/${PYTORCH_ROCM_ARCH}/${RUN_ID}"
     SOURCE_DATE_EPOCH   = SDE_TRITON != "" ? SDE_TRITON : null
     BASE_IMAGE          = "${REGISTRY}/${REGISTRY_NAME}/base:${ROCM_VERSION}-${PYTHON_VERSION}"
     TRITON_REF          = TRITON_REF
