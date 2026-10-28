@@ -6,3 +6,5 @@ extend-exclude = ["telemetry/tests/fixtures/**", "go.sum"]
 vertexes = "vertexes"
 # ROCm Heterogeneous System Architecture runtime prefix (HSA_*)
 HSA = "HSA"
+# AOTriton kernel image files (*.aks2)
+aks = "aks"
