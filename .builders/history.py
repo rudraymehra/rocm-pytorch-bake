@@ -76,6 +76,28 @@ def image_key(name):
     return (len(IMAGE_ORDER), name)
 
 
+# Records are named by BUILDKIT_BUILD_NAME, which every bake target sets
+# to rpb/<target>/<arch>/<run-id>. Records from before that carry
+# buildx's default "<checkout dir>/Dockerfile.x (stage)", where the
+# checkout dir is whatever the clone was called.
+OLD_PREFIXES = ("rocm-pytorch-build/", Path(__file__).resolve().parent.parent.name + "/")
+
+
+def display_name(raw):
+    """This pipeline's name for a record, as "pytorch" or "triton (wheel)";
+    None for records of other projects on the shared builders."""
+    if raw.startswith("rpb/"):
+        target = raw.split("/")[1]
+        if target.endswith("-wheel"):
+            stem = target[: -len("-wheel")]
+            return ("pytorch" if stem == "torch" else stem) + " (wheel)"
+        return target
+    for prefix in OLD_PREFIXES:
+        if raw.startswith(prefix):
+            return raw[len(prefix):].replace("Dockerfile.", "")
+    return None
+
+
 def records_for(builder):
     """Raw history records for one builder, newest first."""
     try:
@@ -118,10 +140,9 @@ def by_image(builders):
             # The builders are shared. Without this the summary lists
             # vllm-lmcache's images, and every throwaway build anyone
             # ran on the node, as though they were ours.
-            if not raw.startswith("rocm-pytorch-build/"):
+            name = display_name(raw)
+            if name is None:
                 continue
-            name = raw.replace("rocm-pytorch-build/", "")
-            name = name.replace("Dockerfile.", "")
             # The parenthetical is the Dockerfile stage. "final" is the
             # shipped image, so naming it adds nothing — whereas
             # "(wheel)" distinguishes a second image built from the same
@@ -201,8 +222,8 @@ def main():
         parts = rec.get("ref", "").split("/")
         node = parts[1] if len(parts) >= 3 else "-"
         build = parts[-1][:12]
-        name = (rec.get("name") or "-").replace("rocm-pytorch-build/", "")
-        name = name.replace("Dockerfile.", "")
+        raw = rec.get("name") or "-"
+        name = display_name(raw) or raw
         rows.append((node, build, name[:24], rec.get("status", "?"),
                      duration(rec), layers(rec, builder)))
 
