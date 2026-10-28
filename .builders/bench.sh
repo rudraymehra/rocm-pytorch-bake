@@ -166,9 +166,11 @@ record() {
                 for (i in step) { t++; if (i in hit) c++ }
                 print c, t
             }' "${log}")
-    hits=$(grep -ahE '^Cache hits +[0-9]+' "${log}" | tail -1 | awk '{print $NF}')
-    misses=$(grep -ahE '^Cache misses +[0-9]+' "${log}" | tail -1 | awk '{print $NF}')
-    reqs=$(grep -ahE '^Compile requests +[0-9]+' "${log}" | tail -1 | awk '{print $NF}')
+    # BuildKit prefixes step output ("#7 0.304 Cache hits   70"), so the
+    # counters are matched after whitespace, not at the start of the line.
+    hits=$(grep -ahE '(^|[[:space:]])Cache hits +[0-9]+$' "${log}" | tail -1 | awk '{print $NF}')
+    misses=$(grep -ahE '(^|[[:space:]])Cache misses +[0-9]+$' "${log}" | tail -1 | awk '{print $NF}')
+    reqs=$(grep -ahE '(^|[[:space:]])Compile requests +[0-9]+$' "${log}" | tail -1 | awk '{print $NF}')
     maxjobs=$(grep -ahoE 'MAX_JOBS=[0-9]+' "${log}" | tail -1 | cut -d= -f2)
 
     if [ "${rc}" != 0 ]; then
