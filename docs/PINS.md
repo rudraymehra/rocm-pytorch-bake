@@ -15,7 +15,10 @@ points at the SHA. `scripts/check-pins` (in CI) also checks, against the git hos
 - the `BASE_IMAGE` fallback in `docker/base.Dockerfile` equals the bake default.
 
 The bake file also holds `ROCM_SDK_VERSION`, `PYTHON_VERSION`, `BASE_IMAGE` (by
-digest), `SCCACHE_VERSION` with its tarball sha256, and `RUST_TOOLCHAIN`.
+digest), `SCCACHE_VERSION` with its tarball sha256, `RUST_TOOLCHAIN`, and
+`LMCACHE_CUPY_VERSION`: LMCache built for ROCm requires `cupy-rocm-7-0` without a
+version, and `docker/lmcache.Dockerfile` writes this version into the wheel's
+requirement (the build fails if that requirement line changes upstream).
 
 ## Where the default pins come from
 
@@ -59,7 +62,7 @@ need internet access for them:
 | Component | Fetches | Pinned by |
 |---|---|---|
 | Triton | prebuilt LLVM (about 370 MB), nlohmann/json, NVIDIA toolchain archives for the CUDA backend | `python/build_helpers.py` and the JSON files next to it; LLVM is checked against `llvm-info.json`. Kept in the `rpb-triton-downloads` cache mount. C++ unit tests (googletest) are switched off |
-| torch | AOTriton: the kernel images for the target gfx (sha256 in `cmake/External/aotriton.cmake`), and the AOTriton runtime source, which is built from source because torch has no prebuilt runtime for the SDK's HIP 7.15; that build installs its Python requirements unpinned | `cmake/External/aotriton.cmake` |
+| torch | AOTriton: the kernel images for the target gfx (sha256 in `cmake/External/aotriton.cmake`), and the AOTriton runtime source at the commit torch pins. The runtime is built from source because torch has no prebuilt runtime for the SDK's HIP 7.15 (TheRock's own torch builds take the same path); that build installs its Python build tools unpinned. The torch build fails if the wheel lacks the runtime or the images for `GPU_ARCH` | `cmake/External/aotriton.cmake` |
 | ROCm SDK | `rocm==<version>` is a source package built at install time; the SDK wheels are pinned by version, not hash | `ROCM_SDK_VERSION` |
 
 Python packages that no constraint names (build tools in `base`, vLLM and LMCache

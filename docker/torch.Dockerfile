@@ -39,10 +39,15 @@ ARG MAX_JOBS
 RUN --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=shared \
     --mount=type=bind,from=hipified,source=/w/torch/requirements-build.txt,target=/tmp/torch-requirements-build.txt \
     python3 -m pip install -r /tmp/torch-requirements-build.txt
+COPY docker/torch-rocm-init.py /rpb/torch-rocm-init.py
+# AOTriton: torch has no prebuilt AOTriton runtime for this SDK's HIP version, so its
+# CMake builds the runtime from source (git, at the commit torch pins) and downloads
+# the kernel images for GPU_ARCH (sha256 pinned by torch), as TheRock's builds do.
 RUN --mount=type=bind,from=hipified,source=/w/torch,target=/w/torch,rw \
     --mount=type=cache,id=rpb-sccache-torch-${GPU_ARCH},target=/root/.cache/sccache,sharing=locked \
     --mount=type=secret,id=sccache_env,required=false \
     cd /w/torch \
+    && sed "s/@ROCM_SDK_VERSION@/${ROCM_SDK_VERSION}/" /rpb/torch-rocm-init.py > torch/_rocm_init.py \
     && export USE_ROCM=1 USE_CUDA=0 BUILD_TEST=0 INSTALL_TEST=0 BUILD_DEBUG_INFO=0 USE_CCACHE=0 \
               PYTORCH_ROCM_ARCH="${GPU_ARCH}" MAX_JOBS="${MAX_JOBS}" \
               PYTORCH_BUILD_VERSION="${TORCH_VERSION}+rpb.${GPU_ARCH}" PYTORCH_BUILD_NUMBER=1 \
@@ -61,6 +66,11 @@ RUN --mount=type=tmpfs,target=/tmp/tw \
     set -eu; \
     whl=$(ls /out/torch-*.whl); \
     python3 -m wheel unpack "$whl" -d /tmp/tw; \
+    t=$(echo /tmp/tw/torch-*/torch); \
+    test -f "$t/_rocm_init.py" || { echo "torch wheel has no _rocm_init.py" >&2; exit 1; }; \
+    test -f "$t/lib/libaotriton_v2.so" || { echo "torch wheel has no AOTriton runtime" >&2; exit 1; }; \
+    test -n "$(find "$t/lib/aotriton.images/amd-${GPU_ARCH}" -type f -name '*.aks2' -print -quit)" \
+        || { echo "torch wheel has no AOTriton kernel images for ${GPU_ARCH}" >&2; exit 1; }; \
     rpb-set-rocm-rpath /tmp/tw/torch-*; \
     rm "$whl"; \
     python3 -m wheel pack /tmp/tw/torch-* -d /out; \

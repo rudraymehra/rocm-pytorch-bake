@@ -25,15 +25,20 @@ RUN set -eu; \
         echo "applying $p"; \
         patch -p1 --forward --batch < "$p"; \
     done
-# Drop NVIDIA-only requirements and relax numpy exactly as vLLM's Dockerfile.rocm does.
+# Drop NVIDIA-only requirements and relax numpy exactly as vLLM's Dockerfile.rocm does,
+# and pin the CuPy that BUILD_WITH_HIP=1 adds to the wheel (unpinned upstream).
 # The test lines fail the build if upstream changes these lines.
+ARG LMCACHE_CUPY_VERSION
 RUN cd /w/lmcache \
     && test "$(grep -Ec '^(cufile-python|nvtx)([<=>[:space:]]|$)' requirements/common.txt)" -eq 2 \
     && test "$(grep -Fxc 'numpy<=2.2.6' requirements/common.txt)" -eq 1 \
+    && test "$(grep -Fxc 'cupy-rocm-7-0' requirements/rocm_core.txt)" -eq 1 \
     && sed -i -E \
         -e '/^(cufile-python|nvtx)([<=>[:space:]]|$)/d' \
         -e 's/^numpy<=2\.2\.6$/numpy<=2.3.5/' \
-        requirements/common.txt
+        requirements/common.txt \
+    && sed -i "s/^cupy-rocm-7-0\$/cupy-rocm-7-0==${LMCACHE_CUPY_VERSION}/" requirements/rocm_core.txt \
+    && grep -Fx "cupy-rocm-7-0==${LMCACHE_CUPY_VERSION}" requirements/rocm_core.txt
 RUN --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=shared \
     python3 -m pip install -r /w/lmcache/requirements/build.txt
 
@@ -41,6 +46,7 @@ FROM prepared AS build
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG GPU_ARCH
 ARG LMCACHE_VERSION
+ARG LMCACHE_CUPY_VERSION
 ARG MAX_JOBS
 RUN --mount=type=cache,id=rpb-sccache-lmcache-${GPU_ARCH},target=/root/.cache/sccache,sharing=locked \
     --mount=type=secret,id=sccache_env,required=false \
@@ -52,7 +58,9 @@ RUN --mount=type=cache,id=rpb-sccache-lmcache-${GPU_ARCH},target=/root/.cache/sc
               BUILD_WITH_HIP=1 CXX=hipcc MAX_JOBS="${MAX_JOBS}" \
               SCCACHE_CACHE_SIZE=5G \
     && rpb-sccache-run lmcache -- python3 setup.py bdist_wheel --dist-dir=/out \
-    && test "$(find /out -maxdepth 1 -name 'lmcache-*.whl' | wc -l)" -eq 1
+    && test "$(find /out -maxdepth 1 -name 'lmcache-*.whl' | wc -l)" -eq 1 \
+    && python3 -c 'import sys, zipfile; z = zipfile.ZipFile(sys.argv[1]); m = next(n for n in z.namelist() if n.endswith(".dist-info/METADATA")); print(z.read(m).decode())' /out/lmcache-*.whl \
+        | grep -Fx "Requires-Dist: cupy-rocm-7-0==${LMCACHE_CUPY_VERSION}"
 
 # The extension must contain code for exactly GPU_ARCH and nothing else.
 RUN --mount=type=tmpfs,target=/tmp/lmcache-wheel \

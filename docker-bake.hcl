@@ -169,6 +169,15 @@ variable "LMCACHE_VERSION" {
   default     = "0.5.3"
   description = "Version written into the LMCache wheel (setuptools-scm)"
 }
+variable "LMCACHE_CUPY_VERSION" {
+  type        = string
+  default     = "14.2.0"
+  description = "cupy-rocm-7-0 version the LMCache wheel requires (upstream leaves it unpinned)"
+  validation {
+    condition     = can(regex("^[0-9]+\\.[0-9]+\\.[0-9]+$", LMCACHE_CUPY_VERSION))
+    error_message = "LMCACHE_CUPY_VERSION must look like 14.2.0."
+  }
+}
 variable "VLLM_REF" {
   type        = string
   default     = "e8ae84bf7e992c63570905fce3073fd7a7de2412"
@@ -443,6 +452,7 @@ target "lmcache-wheel" {
     LMCACHE_REF         = LMCACHE_REF
     LMCACHE_SHA         = LMCACHE_SHA
     LMCACHE_VERSION     = LMCACHE_VERSION
+    LMCACHE_CUPY_VERSION = LMCACHE_CUPY_VERSION
     MAX_JOBS            = FANOUT_JOBS
     BUILDKIT_BUILD_NAME = "rpb/lmcache-wheel/${GPU_ARCH}/${RUN_ID}"
   }

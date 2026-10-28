@@ -194,7 +194,7 @@ One dependency to note: in BuildKit GC, each rule's size limit is compared with 
 
 - ROCm is never bundled into our wheels. For gfx942 the ROCm runtime is about 2.4 GiB, mostly hipBLASLt kernels, which is far larger than torch's own device code (about 51 MiB).
 - **Two flavours:**
-  - Depend on a pinned TheRock `rocm-sdk` (implemented): the torch wheel declares `rocm[libraries]==<ROCM_SDK_VERSION>` and its shared objects find the ROCm libraries next to torch through RPATH, as PyTorch's own TheRock wheels do.
+  - Depend on a pinned TheRock `rocm-sdk` (implemented): the torch wheel declares `rocm[libraries]==<ROCM_SDK_VERSION>`, its shared objects find the ROCm libraries next to torch through RPATH, and `torch/_rocm_init.py` preloads them on `import torch` with the same list as AMD's torch 2.13.0+rocm10.0.0 wheel, so libraries loaded after torch (LMCache's CuPy) find them too. The test stage checks this without the image's loader path, as in a user's environment.
   - Assume a system ROCm already installed on the node (not implemented yet).
 - **Trims:**
   - Single arch.
@@ -368,7 +368,8 @@ None of these need a GPU.
 ## 10. Changes since v2
 
 - torchvision is built from source (Section 4.7), and torch-dev now holds torch, Triton and torchvision.
-- The torch wheel declares its ROCm dependency and sets RPATHs to TheRock's packages; amdsmi is built and shipped.
+- The torch wheel declares its ROCm dependency, sets RPATHs to TheRock's packages and preloads them through `torch/_rocm_init.py`; amdsmi is built and shipped.
+- The torch build fails if the wheel lacks the AOTriton runtime or its kernel images; LMCache's `cupy-rocm-7-0` is pinned.
 - `GPU_ARCH` is limited to gfx90a, gfx942 and gfx950; every build is pinned to linux/amd64.
 - Site values move from an override file to environment variables, which keep validation.
 - GC rules expire by age, with size handled only by the backstop rules (Section 4.5); history limits are smaller.

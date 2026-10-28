@@ -14,6 +14,17 @@ RUN --mount=type=bind,from=torch-wheel,target=/wheels/torch \
     --mount=type=cache,id=rpb-pip,target=/root/.cache/pip,sharing=shared \
     python3 -m pip install /wheels/*/*.whl \
     && python3 -m pip check
+# As in a user's environment, without this image's ROCm loader path: torch must load
+# its ROCm libraries itself (torch/_rocm_init.py and RPATH), and LMCache's CuPy
+# (cupy-rocm-7-0, built for ROCm 7.0) must then load against this SDK. Calling the
+# HIP runtime binds its symbols; with no GPU it reports hipErrorNoDevice.
+RUN set -eu; \
+    mv /etc/ld.so.conf.d/rocm-pip.conf /tmp/rocm-pip.conf; ldconfig; \
+    status=0; \
+    env -u LD_LIBRARY_PATH python3 -c "import torch, lmcache; import cupy_backends.cuda.api.runtime as rt, cupy.cuda.stream, cupy.cuda.memory, cupy_backends.cuda.libs.cublas, cupy_backends.cuda.libs.nccl; print('torch', torch.__version__, 'with LMCache CuPy on HIP', rt.runtimeGetVersion())" \
+        || status=$?; \
+    mv /tmp/rocm-pip.conf /etc/ld.so.conf.d/rocm-pip.conf; ldconfig; \
+    exit "$status"
 COPY --chmod=0755 scripts/rpb-check-offload-arch /usr/local/bin/rpb-check-offload-arch
 RUN python3 -c "import torch; assert torch.version.hip, 'not a ROCm torch'; assert '+rpb.' in torch.__version__, torch.__version__; print(torch.__version__, torch.version.hip, torch.version.git_version)" \
     && python3 -c "import torchvision; assert '+rpb.' in torchvision.__version__, torchvision.__version__; print('torchvision', torchvision.__version__)" \
