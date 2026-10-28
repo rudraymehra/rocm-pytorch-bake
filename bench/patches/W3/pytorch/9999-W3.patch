@@ -1,0 +1,8 @@
+--- a/aten/src/ATen/native/Activation.cpp	2026-10-27 16:01:14
++++ b/aten/src/ATen/native/Activation.cpp	2026-10-27 16:01:14
+@@ -847,3 +847,5 @@
+ DEFINE_DISPATCH(GeluBackwardKernel);
+ 
+ }  // namespace at::native
++
++int rpb_w3_marker() { return 1; }

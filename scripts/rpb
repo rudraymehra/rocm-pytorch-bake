@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# Run one bake on one builder and record everything about it in results/<run_id>/.
+#
+#   scripts/rpb build --builder rpb-build1 [--scenario C0] [--config rpb] [--host-class m7a.16xlarge]
+#                     [--targets "wheels test"] [-- <extra docker buildx bake args>]
+#
+# Environment: RPB_TEXTFILE_DIR (optional) = node-exporter textfile directory; the run
+#              writes rpb_<scenario>_<config>_<gfx>_<builder>_<targets>.prom there.
+#              RPB_RUN_DIR_FILE (optional) = file to receive this run's results directory.
+# Exit status is the bake's exit status. Telemetry is collected either way, and a
+# telemetry problem is reported as a warning without changing the exit status.
+set -euo pipefail
+
+repo=$(cd "$(dirname "$0")/.." && pwd)
+cd "$repo"
+
+usage() { sed -n '2,11p' "$0" >&2; exit 2; }
+warn() { echo "rpb: warning: $*" >&2; }
+
+[ "${1:-}" = "build" ] || usage
+shift
+builder="" scenario="dev" config="rpb" host_class="${RPB_HOST_CLASS:-local}" targets="wheels test"
+extra=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --builder|--scenario|--config|--host-class|--targets)
+            [ "$#" -ge 2 ] || usage
+            case "$1" in
+                --builder) builder=$2 ;;
+                --scenario) scenario=$2 ;;
+                --config) config=$2 ;;
+                --host-class) host_class=$2 ;;
+                --targets) targets=$2 ;;
+            esac
+            shift 2 ;;
+        --) shift; extra=("$@"); break ;;
+        *) usage ;;
+    esac
+done
+[ -n "$builder" ] || usage
+read -r -a target_list <<< "$targets"
+[ "${#target_list[@]}" -gt 0 ] || usage
+
+# bake --var and --jobs need buildx v0.38.0; older versions fail with "unknown flag".
+bx=$(docker buildx version | awk '{print $2}' | sed 's/^v//')
+case "$bx" in
+    0.[0-9].*|0.[0-2][0-9].*|0.3[0-7].*) echo "rpb: buildx $bx is too old; v0.38.0 or later is needed" >&2; exit 2 ;;
+esac
+
+# buildx refuses to read files outside the working directory unless allowed. Grant
+# read access to the directory of the sccache secret file only, if one is given.
+secret_file=${SCCACHE_ENV_FILE:-}
+for ((i = 0; i < ${#extra[@]}; i++)); do
+    case "${extra[i]}" in
+        SCCACHE_ENV_FILE=*) secret_file=${extra[i]#SCCACHE_ENV_FILE=} ;;
+        --var=SCCACHE_ENV_FILE=*) secret_file=${extra[i]#--var=SCCACHE_ENV_FILE=} ;;
+    esac
+done
+allow=()
+if [ -n "$secret_file" ]; then
+    [ -f "$secret_file" ] || { echo "rpb: SCCACHE_ENV_FILE $secret_file does not exist" >&2; exit 2; }
+    allow=(--allow "fs.read=$(cd "$(dirname "$secret_file")" && pwd)")
+fi
+
+# The builder and a random suffix are part of the id: scripts/rpb-cluster starts
+# runs on several builders in the same second, and every run needs its own directory.
+sha=$(git rev-parse --short HEAD)
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$sha-$builder-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')"
+res="results/$run_id"
+mkdir -p "$res/inspect" "$res/steps" "$res/telemetry"
+if [ -n "${RPB_RUN_DIR_FILE:-}" ]; then
+    echo "$res" > "$RPB_RUN_DIR_FILE"
+fi
+
+if ! docker buildx bake --builder "$builder" ${allow[@]+"${allow[@]}"} --var "RUN_ID=$run_id" ${extra[@]+"${extra[@]}"} \
+        --print "${target_list[@]}" > "$res/bake-print.json" 2> "$res/bake-print.err"; then
+    cat "$res/bake-print.err" >&2
+    rm -rf "$res"
+    echo "rpb: the bake definition did not resolve; nothing was built" >&2
+    exit 2
+fi
+gpu_arch=$(python3 -c 'import json,sys; t=json.load(open(sys.argv[1]))["target"]; print(next(iter(t.values()))["args"]["GPU_ARCH"])' "$res/bake-print.json")
+python3 -m telemetry.runmeta pins "$res/bake-print.json" > "$res/pins.json"
+# Only this run's own output directories are cleared, so parallel runs on other
+# builders (scripts/rpb-cluster) do not delete each other's wheels.
+outputs=()
+while IFS= read -r dest; do outputs+=("$dest"); done < <(python3 -m telemetry.runmeta outputs "$res/bake-print.json")
+for dest in ${outputs[@]+"${outputs[@]}"}; do rm -rf "$dest"; done
+
+# On an EC2 benchmark host (infra/ec2/user-data.sh) a dead-man switch powers the
+# machine off when /run/rpb/heartbeat is older than 30 minutes. Keep it fresh while
+# the build runs and remove it at the end, so it only fires if this process dies.
+heartbeat=/run/rpb/heartbeat beat_pid=""
+if [ -d /run/rpb ]; then
+    touch "$heartbeat"
+    ( while sleep 60; do touch "$heartbeat"; done ) &
+    beat_pid=$!
+    trap 'kill "$beat_pid" 2>/dev/null; rm -f "$heartbeat"' EXIT
+fi
+
+now() { python3 -c "import time; print(time.time())"; }
+t_start=$(now)
+status=0
+docker buildx bake --builder "$builder" --jobs defer-error ${allow[@]+"${allow[@]}"} \
+    --var "RUN_ID=$run_id" --metadata-file "$res/bake-metadata.json" --progress plain \
+    ${extra[@]+"${extra[@]}"} "${target_list[@]}" 2>&1 | tee "$res/bake.log" || status=$?
+t_end=$(now)
+
+# From here on nothing may change the exit status: every step only warns.
+set +e
+
+# Map each target to its BuildKit history record: history ls finds every record of
+# this run by name (including failed targets); the metadata file adds exact refs.
+docker buildx history ls --builder "$builder" --format json --no-trunc --filter "startedAt>24h" \
+    > "$res/history-ls.json" 2> "$res/history-ls.err" || warn "history ls failed: $(cat "$res/history-ls.err")"
+python3 -m telemetry.runmeta refs "$res/bake-metadata.json" "$res/history-ls.json" "$run_id" > "$res/refs.tsv" \
+    || warn "could not map targets to history records"
+while IFS=$'\t' read -r target ref; do
+    if ! docker buildx history inspect --builder "$builder" "$ref" --format json > "$res/inspect/$target.json" 2> "$res/inspect/$target.err"; then
+        warn "history inspect $target ($ref) failed: $(cat "$res/inspect/$target.err")"
+    fi
+    docker buildx history logs --builder "$builder" --progress=rawjson "$ref" 2> "$res/steps/$target.jsonl" >/dev/null \
+        || warn "history logs $target ($ref) failed"
+done < "$res/refs.tsv"
+
+existing=()
+for dest in ${outputs[@]+"${outputs[@]}"}; do
+    [ -d "$dest" ] || continue
+    existing+=("$dest")
+    if [ -d "$dest/telemetry" ]; then
+        cp "$dest"/telemetry/* "$res/telemetry/" 2>/dev/null
+    fi
+done
+if [ "${#existing[@]}" -gt 0 ]; then
+    python3 -m telemetry.runmeta wheels "${existing[@]}" > "$res/wheels.json" || warn "could not list wheels"
+fi
+
+python3 - "$res" "$run_id" "$scenario" "$config" "$host_class" "$gpu_arch" "$t_start" "$t_end" "$status" "$builder" "$targets" <<'EOF'
+import json, os, platform, subprocess, sys
+res, run_id, scenario, config, host_class, gpu, t0, t1, status, builder, targets = sys.argv[1:]
+def out(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
+    except Exception:
+        return None
+def builder_node(name):
+    # The daemon's own host name (a BuildKit worker label): which machine really ran
+    # the build, whatever the builder is called on this client.
+    for line in (out("docker", "buildx", "inspect", name) or "").splitlines():
+        key, _, value = line.strip().partition(":")
+        if key == "org.mobyproject.buildkit.worker.hostname":
+            return value.strip()
+    return None
+meta = {
+    "run_id": run_id, "scenario": scenario, "config": config, "host_class": host_class,
+    "gpu_arch": gpu, "t_start": float(t0), "t_end": float(t1),
+    "status": "ok" if status == "0" else "failed", "exit_code": int(status),
+    "builder": builder, "builder_node": builder_node(builder),
+    "target_set": ",".join(sorted(targets.split())),
+    "repo_commit": out("git", "rev-parse", "HEAD"),
+    "buildx_version": out("docker", "buildx", "version"),
+    "client_host": platform.node(),
+    "pins": json.load(open(os.path.join(res, "pins.json"))),
+}
+json.dump(meta, open(os.path.join(res, "meta.json"), "w"), indent=2, sort_keys=True)
+EOF
+
+if python3 -m telemetry.collect "$res" >/dev/null; then
+    if [ -n "${RPB_TEXTFILE_DIR:-}" ]; then
+        python3 -m telemetry.prom "$res/record.json" "$RPB_TEXTFILE_DIR" \
+            || warn "could not write the Prometheus textfile in $RPB_TEXTFILE_DIR (is it writable by $(id -un)?)"
+    fi
+else
+    warn "telemetry.collect failed; the raw files are in $res"
+fi
+echo "run $run_id: status $status, results in $res"
+exit "$status"

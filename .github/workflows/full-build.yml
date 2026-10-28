@@ -1,0 +1,64 @@
+# Tier T2: the full build on a self-hosted builder. Never runs for pull requests.
+# Enabled only when the repository variable RPB_SELF_HOSTED is "true".
+# Keeping this file off pull requests does not protect the runner by itself: a fork
+# could add its own workflow that targets the same labels. docs/CI.md lists the
+# repository settings that must be in place before a runner is registered.
+name: full-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: Scenario code recorded in the telemetry (for example C0, W0, nightly)
+        default: manual
+        required: true
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: vars.RPB_SELF_HOSTED == 'true'
+    runs-on: [self-hosted, linux, x64, rpb-builder]
+    # A cold build on a small host takes many hours; RPB_TIMEOUT_MINUTES overrides this.
+    timeout-minutes: ${{ fromJSON(vars.RPB_TIMEOUT_MINUTES || '600') }}
+    environment: self-hosted
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build everything and record telemetry
+        env:
+          SCENARIO: ${{ github.event_name == 'schedule' && 'nightly' || inputs.scenario }}
+          BUILDER: ${{ vars.RPB_BUILDER }}
+          RPB_HOST_CLASS: ${{ vars.RPB_HOST_CLASS }}
+          RPB_TEXTFILE_DIR: ${{ vars.RPB_TEXTFILE_DIR }}
+          CACHE_REGISTRY: ${{ vars.RPB_CACHE_REGISTRY }}
+          SCCACHE_ENV_FILE: ${{ vars.RPB_SCCACHE_ENV_FILE }}
+          # checkout removes the gitignored rpb.env, so site values come from variables
+          MAX_JOBS: ${{ vars.RPB_MAX_JOBS }}
+          FANOUT_JOBS: ${{ vars.RPB_FANOUT_JOBS }}
+        run: |
+          for v in BUILDER CACHE_REGISTRY SCCACHE_ENV_FILE; do
+            if [ -z "${!v}" ]; then echo "::error::repository variable RPB_$v is not set"; exit 2; fi
+          done
+          site=()
+          if [ -n "$MAX_JOBS" ]; then site+=(--var "MAX_JOBS=$MAX_JOBS"); fi
+          if [ -n "$FANOUT_JOBS" ]; then site+=(--var "FANOUT_JOBS=$FANOUT_JOBS"); fi
+          scripts/rpb build --builder "$BUILDER" --scenario "$SCENARIO" --targets "wheels test" -- \
+            --var "CACHE_REGISTRY=$CACHE_REGISTRY" --var "SCCACHE_ENV_FILE=$SCCACHE_ENV_FILE" "${site[@]}"
+
+      - name: Keep the run record
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-${{ github.run_id }}
+          path: results/
+          retention-days: 90

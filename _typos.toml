@@ -1,0 +1,10 @@
+[files]
+extend-exclude = ["telemetry/tests/fixtures/**", "go.sum"]
+
+[default.extend-words]
+# BuildKit's JSON field name for the list of build vertices
+vertexes = "vertexes"
+# ROCm Heterogeneous System Architecture runtime prefix (HSA_*)
+HSA = "HSA"
+# AOTriton kernel image files (*.aks2)
+aks = "aks"

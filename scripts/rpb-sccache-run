@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Run one compile command under a private sccache server and record its telemetry.
+#
+#   rpb-sccache-run <name> -- <command> [args...]
+#
+# Writes /out/telemetry/<name>-sccache.json, <name>-time.txt, <name>-sccache-remote.txt and
+# <name>-started.txt (Unix time of this step, so a record can tell a fresh compile
+# from telemetry that came back inside a cached layer).
+# If the BuildKit secret "sccache_env" is mounted, it is sourced first; it turns on
+# the shared Redis level (SCCACHE_MULTILEVEL_CHAIN=disk,redis plus credentials).
+# If that level is unreachable, the build continues with the local disk level only,
+# unless the secret sets RPB_SCCACHE_REQUIRE_REMOTE=1 (tests and benchmarks), which
+# fails the step instead. <name>-sccache-remote.txt records which case happened:
+#   redis     the shared level was used without errors
+#   none      no shared level was configured (no secret)
+#   fallback  a shared level was configured but unreachable at the start; local disk only
+#   degraded  the shared level failed during the compile (Redis errors in sccache's
+#             stats); every failing Redis call waits for its timeout, so such a step
+#             is much slower. Strict mode fails the step.
+set -euo pipefail
+
+if [ "$#" -lt 3 ] || [ "$2" != "--" ]; then
+    echo "usage: rpb-sccache-run <name> -- <command> [args...]" >&2
+    exit 2
+fi
+name=$1
+shift 2
+
+telemetry_dir=${RPB_TELEMETRY_DIR:-/out/telemetry}
+mkdir -p "$telemetry_dir"
+
+secret=/run/secrets/sccache_env
+if [ -f "$secret" ]; then
+    set -a
+    # shellcheck source=/dev/null
+    . "$secret"
+    set +a
+fi
+
+# BuildKit RUN steps share the daemon's network namespace, so concurrent steps
+# would collide on sccache's default TCP port. A Unix socket in this step's own
+# filesystem keeps each server private.
+export SCCACHE_SERVER_UDS=/tmp/rpb-sccache-${name}.sock
+
+remote=none
+if [ -n "${SCCACHE_MULTILEVEL_CHAIN:-}" ]; then
+    remote=redis
+    # With sccache's default write policy (l0) an unreachable Redis is accepted at
+    # startup, so "redis" would be recorded for a run that never reached it. "all"
+    # makes startup check every level.
+    export SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY=${SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY:-all}
+    if [ "$SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY" != all ]; then
+        echo "rpb-sccache-run: SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY=$SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY; only 'all' lets this script tell whether Redis is reachable" >&2
+        exit 1
+    fi
+fi
+if ! sccache --start-server; then
+    if [ "$remote" = none ]; then
+        echo "rpb-sccache-run: sccache server failed to start" >&2
+        exit 1
+    fi
+    if [ "${RPB_SCCACHE_REQUIRE_REMOTE:-0}" = 1 ]; then
+        echo "rpb-sccache-run: shared cache level unavailable and RPB_SCCACHE_REQUIRE_REMOTE=1; failing" >&2
+        exit 1
+    fi
+    echo "rpb-sccache-run: shared cache level unavailable; continuing with the local disk level only" >&2
+    remote=fallback
+    # Every Redis and multi-level setting, whichever form the secret used.
+    for v in $(compgen -e); do
+        case "$v" in SCCACHE_REDIS*|SCCACHE_MULTILEVEL*) unset "$v" ;; esac
+    done
+    # A new socket: a first server that is still waiting for a slow Redis could
+    # otherwise take over the socket later and use Redis after all.
+    export SCCACHE_SERVER_UDS=/tmp/rpb-sccache-${name}-local.sock
+    sccache --start-server
+fi
+echo "$remote" > "$telemetry_dir/${name}-sccache-remote.txt"
+date +%s > "$telemetry_dir/${name}-started.txt"
+sccache --zero-stats >/dev/null
+
+status=0
+/usr/bin/time -v -o "$telemetry_dir/${name}-time.txt" "$@" || status=$?
+
+# Written only when complete, so a failed stats call leaves no half-written file.
+if sccache --show-stats --stats-format=json > "$telemetry_dir/${name}-sccache.json.tmp"; then
+    mv "$telemetry_dir/${name}-sccache.json.tmp" "$telemetry_dir/${name}-sccache.json"
+else
+    rm -f "$telemetry_dir/${name}-sccache.json.tmp"
+    echo "rpb-sccache-run: could not read sccache stats" >&2
+fi
+
+# Redis errors during the compile: read, write and timeout counters, and the
+# per-level write failures.
+if [ "$remote" = redis ] && [ -s "$telemetry_dir/${name}-sccache.json" ]; then
+    errors=$(python3 -c '
+import json, sys
+s = json.load(open(sys.argv[1]))["stats"]
+print(s.get("cache_read_errors", 0) + s.get("cache_write_errors", 0) + s.get("cache_timeouts", 0)
+      + sum(level.get("write_failures", 0) for level in s.get("multi_level") or []))
+' "$telemetry_dir/${name}-sccache.json")
+    if [ "$errors" -gt 0 ]; then
+        remote=degraded
+        echo "rpb-sccache-run: $errors Redis errors during the compile; recorded as degraded" >&2
+        echo "$remote" > "$telemetry_dir/${name}-sccache-remote.txt"
+        if [ "${RPB_SCCACHE_REQUIRE_REMOTE:-0}" = 1 ] && [ "$status" -eq 0 ]; then
+            echo "rpb-sccache-run: RPB_SCCACHE_REQUIRE_REMOTE=1; failing" >&2
+            status=1
+        fi
+    fi
+fi
+sccache --stop-server >/dev/null || true
+exit "$status"

@@ -1,0 +1,18 @@
+# Site-specific bake values: rpb.env is covered by *.env below
+docker-bake.override.hcl
+# Build outputs and run records
+out/
+results/
+# Secrets and certificates: never in git
+secrets/
+*.pem
+*.key
+*.env
+# Dev mini-cluster state
+dev/minicluster/.state/
+dev/minicluster/.logs/
+# Python
+__pycache__/
+.pytest_cache/
+.venv/
+.rpb-routes

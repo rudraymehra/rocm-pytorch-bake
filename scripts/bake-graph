@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Print what docker-bake.hcl will build: each target, its Dockerfile, the targets
+it starts from and where its output goes. Reads `docker buildx bake --print`.
+
+    scripts/bake-graph [bake targets...]        # default: all
+"""
+
+import json
+import subprocess
+import sys
+
+targets = sys.argv[1:] or ["all"]
+proc = subprocess.run(["docker", "buildx", "bake", "--print", *targets], capture_output=True, text=True)
+if proc.returncode != 0:
+    sys.stderr.write(proc.stderr)
+    sys.exit(proc.returncode)
+rows = []
+for name, t in sorted(json.loads(proc.stdout)["target"].items()):
+    inputs = sorted(v.removeprefix("target:") for v in (t.get("contexts") or {}).values())
+    outputs = [o.get("dest") or o.get("type") for o in t.get("output") or []]
+    rows.append((name, t.get("dockerfile", "-"), ", ".join(inputs) or "-", ", ".join(outputs)))
+w = [max(len(r[i]) for r in rows) for i in range(3)]
+for name, dockerfile, inputs, outputs in rows:
+    print(f"{name:{w[0]}}  {dockerfile:{w[1]}}  from: {inputs:{w[2]}}  -> {outputs}")

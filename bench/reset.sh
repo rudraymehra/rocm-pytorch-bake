@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Reset caches to a known state before a benchmark run, and print proof.
+#
+#   bench/reset.sh <levels>      e.g. bench/reset.sh BK,SC,RG,OS   (full cold)
+#
+# Runs on the benchmark host, where buildkitd, zot and Valkey all run.
+#   BK  BuildKit state: layers, cache mounts (sccache local level, pip) and history
+#   SC  shared sccache level: FLUSHALL on Valkey
+#   RG  zot: every stored layer-cache blob and manifest
+#   OS  page cache (sync + drop_caches)
+# Needs: STATE_DIR, CACHE_DATA, SECRETS, ZOT_ADDR, CERT_DIR (same values as at install time).
+set -euo pipefail
+
+: "${STATE_DIR:?}" "${CACHE_DATA:?}" "${SECRETS:?}" "${ZOT_ADDR:?}" "${CERT_DIR:?}"
+repo=$(cd "$(dirname "$0")/.." && pwd)
+# compose.yaml needs both even to stop one service; same values as infra/cache-node/install.sh.
+export CACHE_DATA VALKEY_CONF_DIR=/etc/valkey
+IFS=, read -r -a levels <<< "${1:?usage: bench/reset.sh BK,SC,RG,OS}"
+
+# The BK and RG levels delete directory contents: refuse anything that is not
+# clearly a dedicated data directory.
+safe_dir() {
+    case "$1" in
+        ""|/|/root|/home|/var|/usr|/usr/*|/etc|/etc/*|/boot|/boot/*|"$HOME") echo "refusing to wipe '$1'" >&2; exit 2 ;;
+    esac
+    [ -d "$1" ] || { echo "'$1' is not a directory" >&2; exit 2; }
+}
+
+for level in "${levels[@]}"; do
+    case "$level" in
+        BK)
+            safe_dir "$STATE_DIR"
+            docker rm -f buildkitd >/dev/null
+            find "$STATE_DIR" -mindepth 1 -delete
+            echo "BK proof: $(du -sh "$STATE_DIR" | cut -f1) in $STATE_DIR"
+            "$repo/infra/buildkit/run-buildkitd.sh" >/dev/null
+            ;;
+        SC)
+            # shellcheck source=/dev/null
+            . "$SECRETS/valkey-admin.env"
+            export VALKEYCLI_AUTH=$VALKEY_PASSWORD   # not on the command line (visible in ps)
+            cli=(docker exec -e VALKEYCLI_AUTH rpb-cache-valkey-1 valkey-cli -h "$VALKEY_HOST" --user "$VALKEY_USER")
+            "${cli[@]}" flushall >/dev/null
+            echo "SC proof: dbsize=$("${cli[@]}" dbsize)"
+            ;;
+        RG)
+            safe_dir "$CACHE_DATA"
+            docker compose -f "$repo/infra/cache-node/compose.yaml" stop zot >/dev/null
+            find "$CACHE_DATA/zot" -mindepth 1 -delete
+            docker compose -f "$repo/infra/cache-node/compose.yaml" start zot >/dev/null
+            for _ in $(seq 1 30); do curl -fsS "http://$ZOT_ADDR/v2/" >/dev/null 2>&1 && break; sleep 1; done
+            echo "RG proof: $(curl -fsS "http://$ZOT_ADDR/v2/_catalog")"
+            ;;
+        OS)
+            sync
+            echo 3 > /proc/sys/vm/drop_caches
+            echo "OS proof: page cache dropped"
+            ;;
+        *)
+            echo "unknown level $level" >&2
+            exit 2
+            ;;
+    esac
+done

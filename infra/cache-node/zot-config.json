@@ -1,0 +1,43 @@
+{
+  "distSpecVersion": "1.1.1",
+  "storage": {
+    "rootDirectory": "/var/lib/registry",
+    "dedupe": false,
+    "gc": true,
+    "gcDelay": "2h",
+    "gcInterval": "1h",
+    "retention": {
+      "dryRun": false,
+      "delay": "24h",
+      "policies": [
+        {
+          "repositories": ["rpb/cache"],
+          "deleteReferrers": true,
+          "deleteUntagged": true,
+          "keepTags": [{ "patterns": [".*"] }]
+        },
+        {
+          "repositories": ["rpb/torch-dev"],
+          "deleteReferrers": true,
+          "deleteUntagged": true,
+          "keepTags": [{ "mostRecentlyPushedCount": 3 }]
+        }
+      ]
+    }
+  },
+  "http": {
+    "address": "0.0.0.0",
+    "port": "5000",
+    "readTimeout": "30m",
+    "writeTimeout": "30m"
+  },
+  "log": {
+    "level": "info"
+  },
+  "extensions": {
+    "metrics": {
+      "enable": true,
+      "prometheus": { "path": "/metrics" }
+    }
+  }
+}
